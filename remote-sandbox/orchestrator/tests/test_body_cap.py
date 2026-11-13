@@ -46,3 +46,46 @@ def test_read_body_capped_rejects_over_limit() -> None:
     with pytest.raises(HTTPException) as exc:
         asyncio.run(_read_body_capped(req, 100))
     assert exc.value.status_code == 413
+
+
+def test_read_body_capped_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "BODY_READ_TIMEOUT_SECONDS", 0.05)
+
+    async def _slow_chunks() -> None:
+        index = {"i": 0}
+        chunks = [b"a", b"b"]
+
+        async def receive() -> dict:
+            i = index["i"]
+            if i == 0:
+                index["i"] = 1
+                await asyncio.sleep(0.2)
+                return {"type": "http.request", "body": chunks[0], "more_body": True}
+            if i == 1:
+                index["i"] = 2
+                return {"type": "http.request", "body": chunks[1], "more_body": False}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "PUT",
+            "headers": [],
+            "path": "/",
+            "raw_path": b"/",
+            "query_string": b"",
+            "client": ("127.0.0.1", 123),
+            "server": ("test", 80),
+            "scheme": "http",
+        }
+        from starlette.requests import Request
+
+        req = Request(scope, receive)
+        with pytest.raises(HTTPException) as exc:
+            await main._read_body_capped(req, 100)
+        assert exc.value.status_code == 408
+
+    asyncio.run(_slow_chunks())

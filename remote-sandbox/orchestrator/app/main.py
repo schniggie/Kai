@@ -17,10 +17,6 @@ from .docker_mgr import (
     SandboxLimitError,
     sandbox_id_for,
 )
-
-MAX_JSON_BODY_BYTES = 1_000_000
-MAX_INFLIGHT_V1 = int(os.environ.get("MAX_INFLIGHT_V1", "32"))
-_inflight_v1 = asyncio.Semaphore(MAX_INFLIGHT_V1)
 from .models import (
     AcquireRequest,
     ErrorResponse,
@@ -33,6 +29,14 @@ from .models import (
     JobStartRequest,
     SandboxStatusResponse,
 )
+
+MAX_JSON_BODY_BYTES = 1_000_000
+MAX_INFLIGHT_V1 = int(os.environ.get("MAX_INFLIGHT_V1", "32"))
+MAX_INFLIGHT_V1_PER_TOKEN = int(os.environ.get("MAX_INFLIGHT_V1_PER_TOKEN", "8"))
+BODY_READ_TIMEOUT_SECONDS = float(os.environ.get("BODY_READ_TIMEOUT_SECONDS", "30"))
+_inflight_v1 = asyncio.Semaphore(MAX_INFLIGHT_V1)
+_inflight_v1_by_token: dict[str, asyncio.Semaphore] = {}
+_inflight_token_lock = asyncio.Lock()
 
 TOKENS_FILE = Path(os.environ.get("TOKENS_FILE", "/data/tokens.txt"))
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "kai-sandbox:local")
@@ -68,6 +72,15 @@ def current_token(authorization: str | None = Header(default=None)) -> Token:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
+async def _token_inflight_sem(token_id: str) -> asyncio.Semaphore:
+    async with _inflight_token_lock:
+        sem = _inflight_v1_by_token.get(token_id)
+        if sem is None:
+            sem = asyncio.Semaphore(MAX_INFLIGHT_V1_PER_TOKEN)
+            _inflight_v1_by_token[token_id] = sem
+        return sem
+
+
 @app.middleware("http")
 async def auth_and_size_gate(request: Request, call_next):
     """Authenticate /v1 before body buffering; bound concurrent /v1 work and body size."""
@@ -76,7 +89,7 @@ async def auth_and_size_gate(request: Request, call_next):
         return await call_next(request)
 
     try:
-        tokens.authenticate(request.headers.get("authorization"))
+        token = tokens.authenticate(request.headers.get("authorization"))
     except PermissionError as exc:
         return JSONResponse(status_code=401, content={"detail": str(exc)})
 
@@ -93,8 +106,8 @@ async def auth_and_size_gate(request: Request, call_next):
                 content={"detail": f"payload exceeds {limit} bytes"},
             )
 
-    # Admit before FastAPI buffers the body so concurrent oversized/chunked
-    # requests cannot unbounded-grow orchestrator RSS.
+    # Global + per-token admission before FastAPI buffers the body.
+    token_sem = await _token_inflight_sem(token.token_id)
     try:
         await asyncio.wait_for(_inflight_v1.acquire(), timeout=0.05)
     except TimeoutError:
@@ -103,7 +116,19 @@ async def auth_and_size_gate(request: Request, call_next):
             content={"detail": f"at most {MAX_INFLIGHT_V1} concurrent /v1 requests"},
         )
     try:
-        return await call_next(request)
+        try:
+            await asyncio.wait_for(token_sem.acquire(), timeout=0.05)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": f"at most {MAX_INFLIGHT_V1_PER_TOKEN} concurrent /v1 requests per token"
+                },
+            )
+        try:
+            return await call_next(request)
+        finally:
+            token_sem.release()
     finally:
         _inflight_v1.release()
 
@@ -420,17 +445,27 @@ def _assert_safe_path(path: str) -> None:
 
 
 async def _read_body_capped(request: Request, max_bytes: int) -> bytes:
-    """Accumulate at most [max_bytes]; abort with 413 as soon as the cap is exceeded."""
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > max_bytes:
-            raise HTTPException(status_code=413, detail=f"payload exceeds {max_bytes} bytes")
-        chunks.append(chunk)
-    return b"".join(chunks)
+    """Accumulate at most [max_bytes]; abort with 413/408 on size or wall-clock timeout."""
+
+    async def _accumulate() -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=413, detail=f"payload exceeds {max_bytes} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    try:
+        return await asyncio.wait_for(_accumulate(), timeout=BODY_READ_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=408,
+            detail=f"body read timed out after {BODY_READ_TIMEOUT_SECONDS:g}s",
+        ) from exc
 
 
 @app.exception_handler(Exception)
