@@ -25,6 +25,9 @@ DEFAULT_JOB_TIMEOUT_SECONDS = 3600
 MAX_SANDBOX_CONTAINERS = int(__import__("os").environ.get("MAX_SANDBOX_CONTAINERS", "16"))
 MAX_SANDBOXES_PER_TOKEN = int(__import__("os").environ.get("MAX_SANDBOXES_PER_TOKEN", "4"))
 MAX_VOLUME_BYTES = int(__import__("os").environ.get("MAX_VOLUME_BYTES", str(2_000_000_000)))
+# Container writable-layer + volume budget enforced via storage_opt when the
+# Docker host supports it (overlay2 + xfs pquota / btrfs / zfs).
+MAX_CONTAINER_BYTES = int(__import__("os").environ.get("MAX_CONTAINER_BYTES", str(8_000_000_000)))
 PIDS_LIMIT = int(__import__("os").environ.get("PIDS_LIMIT", "256"))
 MAX_CONCURRENT_EXECS_PER_SANDBOX = int(
     __import__("os").environ.get("MAX_CONCURRENT_EXECS_PER_SANDBOX", "4")
@@ -32,6 +35,7 @@ MAX_CONCURRENT_EXECS_PER_SANDBOX = int(
 MAX_CONCURRENT_EXECS_PER_TOKEN = int(
     __import__("os").environ.get("MAX_CONCURRENT_EXECS_PER_TOKEN", "8")
 )
+MAX_CONCURRENT_DOCKER_OPS = int(__import__("os").environ.get("MAX_CONCURRENT_DOCKER_OPS", "32"))
 
 
 class SandboxLimitError(RuntimeError):
@@ -86,6 +90,7 @@ class DockerManager:
         self._provision_lock = threading.Lock()
         self._exec_gate_lock = threading.Lock()
         self._exec_semaphores: dict[str, threading.BoundedSemaphore] = {}
+        self._global_docker_sem = threading.BoundedSemaphore(MAX_CONCURRENT_DOCKER_OPS)
         self._last_used: dict[str, float] = {}
         self._ensure_network()
         threading.Thread(target=self._idle_reaper, daemon=True).start()
@@ -137,25 +142,38 @@ class DockerManager:
                             "kai.device_id": device_id,
                         },
                     )
-                container = self.client.containers.run(
-                    image=self.image,
-                    name=name,
-                    detach=True,
-                    tty=False,
-                    stdin_open=False,
-                    network=self.network_name,
-                    volumes={volume: {"bind": "/root", "mode": "rw"}},
-                    labels={
+                run_kwargs: dict[str, Any] = {
+                    "image": self.image,
+                    "name": name,
+                    "detach": True,
+                    "tty": False,
+                    "stdin_open": False,
+                    "network": self.network_name,
+                    "volumes": {volume: {"bind": "/root", "mode": "rw"}},
+                    "labels": {
                         "kai.sandbox": "1",
                         "kai.sandbox_id": sandbox_id,
                         "kai.token_id": token_id,
                         "kai.device_id": device_id,
                     },
-                    mem_limit="2g",
-                    nano_cpus=2_000_000_000,
-                    pids_limit=PIDS_LIMIT,
-                    restart_policy={"Name": "unless-stopped"},
-                )
+                    "mem_limit": "2g",
+                    "nano_cpus": 2_000_000_000,
+                    "pids_limit": PIDS_LIMIT,
+                    # Cap /tmp so guest dd/apt temp cannot fill the host disk.
+                    "tmpfs": {"/tmp": "rw,nosuid,nodev,size=512m"},
+                    "restart_policy": {"Name": "unless-stopped"},
+                    # Hard container filesystem budget when the graph driver supports it.
+                    "storage_opt": {"size": str(MAX_CONTAINER_BYTES)},
+                }
+                try:
+                    container = self.client.containers.run(**run_kwargs)
+                except APIError as exc:
+                    # Hosts without storage-opt support still get mem/pids/tmpfs/volume caps.
+                    if "storage opt" in str(exc).lower() or "storage-opt" in str(exc).lower():
+                        run_kwargs.pop("storage_opt", None)
+                        container = self.client.containers.run(**run_kwargs)
+                    else:
+                        raise
             else:
                 container.reload()
                 if container.status != "running":
@@ -234,74 +252,75 @@ class DockerManager:
         if prefixes:
             wrapped = " && ".join(prefixes + [f"( {command} )"])
 
-        with self._exec_slot(token_id, sandbox_id):
-            if fresh:
-                result = self._docker_exec(
-                    container,
-                    [
-                        "timeout",
-                        "--signal=KILL",
-                        str(timeout),
-                        "bash",
-                        "--noprofile",
-                        "--norc",
-                        "-c",
-                        wrapped,
-                    ],
-                    timeout=timeout + 5,
-                )
-                self.touch(sandbox_id)
-                return {
-                    "stdout": _truncate_chars(result["stdout"], MAX_JOB_OUTPUT_CHARS),
-                    "stderr": _truncate_chars(result["stderr"], MAX_JOB_OUTPUT_CHARS),
-                    "exit_code": 124 if result["timed_out"] else result["exit_code"],
-                    "timed_out": result["timed_out"] or result["exit_code"] == 124,
-                    "session_id": session_id,
-                }
+        self._assert_under_volume_quota(container)
 
-            raw = self._docker_exec(
+        if fresh:
+            result = self._docker_exec(
                 container,
                 [
-                    "kai-session",
-                    "exec",
-                    "--session-id",
-                    session_id,
-                    "--timeout",
+                    "timeout",
+                    "--signal=KILL",
                     str(timeout),
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
                     wrapped,
                 ],
                 timeout=timeout + 5,
             )
-            # Prefer structured JSON from kai-session when present.
-            try:
-                parsed = json.loads(raw["stdout"] or "{}")
-                if parsed.get("ok"):
-                    self.touch(sandbox_id)
-                    return {
-                        "stdout": _truncate_chars(str(parsed.get("stdout", "")), MAX_JOB_OUTPUT_CHARS),
-                        "stderr": _truncate_chars(str(parsed.get("stderr", "")), MAX_JOB_OUTPUT_CHARS),
-                        "exit_code": int(parsed.get("exit_code", 0)),
-                        "timed_out": bool(parsed.get("timed_out", False)),
-                        "session_id": session_id,
-                    }
-                err = parsed.get("error") or raw["stderr"] or "session exec failed"
+            self.touch(sandbox_id)
+            return {
+                "stdout": _truncate_chars(result["stdout"], MAX_JOB_OUTPUT_CHARS),
+                "stderr": _truncate_chars(result["stderr"], MAX_JOB_OUTPUT_CHARS),
+                "exit_code": 124 if result["timed_out"] else result["exit_code"],
+                "timed_out": result["timed_out"] or result["exit_code"] == 124,
+                "session_id": session_id,
+            }
+
+        raw = self._docker_exec(
+            container,
+            [
+                "kai-session",
+                "exec",
+                "--session-id",
+                session_id,
+                "--timeout",
+                str(timeout),
+                wrapped,
+            ],
+            timeout=timeout + 5,
+        )
+        # Prefer structured JSON from kai-session when present.
+        try:
+            parsed = json.loads(raw["stdout"] or "{}")
+            if parsed.get("ok"):
                 self.touch(sandbox_id)
                 return {
-                    "stdout": "",
-                    "stderr": str(err),
-                    "exit_code": 1,
-                    "timed_out": False,
+                    "stdout": _truncate_chars(str(parsed.get("stdout", "")), MAX_JOB_OUTPUT_CHARS),
+                    "stderr": _truncate_chars(str(parsed.get("stderr", "")), MAX_JOB_OUTPUT_CHARS),
+                    "exit_code": int(parsed.get("exit_code", 0)),
+                    "timed_out": bool(parsed.get("timed_out", False)),
                     "session_id": session_id,
                 }
-            except json.JSONDecodeError:
-                self.touch(sandbox_id)
-                return {
-                    "stdout": raw["stdout"],
-                    "stderr": raw["stderr"] or "bad session response",
-                    "exit_code": raw["exit_code"],
-                    "timed_out": raw["timed_out"],
-                    "session_id": session_id,
-                }
+            err = parsed.get("error") or raw["stderr"] or "session exec failed"
+            self.touch(sandbox_id)
+            return {
+                "stdout": "",
+                "stderr": str(err),
+                "exit_code": 1,
+                "timed_out": False,
+                "session_id": session_id,
+            }
+        except json.JSONDecodeError:
+            self.touch(sandbox_id)
+            return {
+                "stdout": raw["stdout"],
+                "stderr": raw["stderr"] or "bad session response",
+                "exit_code": raw["exit_code"],
+                "timed_out": raw["timed_out"],
+                "session_id": session_id,
+            }
 
     def close_session(self, token_id: str, device_id: str, session_id: str) -> None:
         sandbox_id = sandbox_id_for(token_id, device_id)
@@ -358,22 +377,22 @@ class DockerManager:
                 f"exec bash --noprofile --norc -c {shlex.quote(inner)}"
             )
             try:
-                with self._exec_slot(token_id, sandbox_id):
-                    result = self._docker_exec(
-                        container,
-                        [
-                            "timeout",
-                            "--signal=KILL",
-                            str(DEFAULT_JOB_TIMEOUT_SECONDS),
-                            "bash",
-                            "--noprofile",
-                            "--norc",
-                            "-c",
-                            wrapped,
-                        ],
-                        timeout=DEFAULT_JOB_TIMEOUT_SECONDS + 5,
-                        job=job,
-                    )
+                self._assert_under_volume_quota(container)
+                result = self._docker_exec(
+                    container,
+                    [
+                        "timeout",
+                        "--signal=KILL",
+                        str(DEFAULT_JOB_TIMEOUT_SECONDS),
+                        "bash",
+                        "--noprofile",
+                        "--norc",
+                        "-c",
+                        wrapped,
+                    ],
+                    timeout=DEFAULT_JOB_TIMEOUT_SECONDS + 5,
+                    job=job,
+                )
             except SandboxLimitError as exc:
                 with self._jobs_lock:
                     job.status = "finished"
@@ -590,15 +609,30 @@ print(dest)
         last_err = "not ready"
         while time.time() < deadline:
             container.reload()
-            if container.status == "running" and self._ping_sessiond(container):
+            # Housekeeping so readiness probes never contend with user exec slots.
+            if container.status == "running" and self._ping_sessiond(container, housekeeping=True):
                 return
             last_err = container.status
             time.sleep(0.4)
         raise RuntimeError(f"sandbox not ready: {last_err}")
 
-    def _ping_sessiond(self, container: Container) -> bool:
+    def _assert_under_volume_quota(self, container: Container) -> None:
+        usage = self._disk_usage(container)
+        if usage > MAX_VOLUME_BYTES:
+            raise SandboxLimitError(
+                f"volume quota {MAX_VOLUME_BYTES} bytes exceeded (used={usage}); "
+                "delete files or wipe the sandbox"
+            )
+
+    def _ping_sessiond(self, container: Container, *, housekeeping: bool = False) -> bool:
         try:
-            result = self._docker_exec(container, ["kai-session", "ping"], timeout=5, _raw=True)
+            result = self._docker_exec(
+                container,
+                ["kai-session", "ping"],
+                timeout=5,
+                _raw=True,
+                _housekeeping=housekeeping,
+            )
             if result["exit_code"] != 0:
                 return False
             data = json.loads(result["stdout"] or "{}")
@@ -640,6 +674,7 @@ print(dest)
             return sem
 
     def _disk_usage(self, container: Container) -> int:
+        # Goes through normal admission so status/FS quota checks share the pool.
         result = self._docker_exec(
             container,
             ["bash", "-c", "du -sb /root 2>/dev/null | cut -f1"],
@@ -666,19 +701,49 @@ print(dest)
         binary: bool = False,
         job: BackgroundJob | None = None,
         _raw: bool = False,
+        _housekeeping: bool = False,
     ) -> dict[str, Any]:
         """Run a command with a wall-clock deadline and a hard output byte cap.
 
-        The stream reader runs on a side thread so a silent (no-output) command
-        still hits the deadline. Guest PID is recorded so timeout kill works
-        inside the container namespace (host os.kill is unreliable for execs).
+        Non-housekeeping calls take a global Docker slot plus per-token/sandbox
+        slots so FS/status/exec share the same admission control. Housekeeping
+        (timeout kill, readiness ping) bypasses slots to avoid self-deadlock.
         """
+        if _housekeeping:
+            return self._docker_exec_body(
+                container, cmd, timeout, binary=binary, job=job, wrap_pid=not _raw
+            )
+
+        if not self._global_docker_sem.acquire(blocking=False):
+            raise SandboxLimitError(
+                f"at most {MAX_CONCURRENT_DOCKER_OPS} concurrent docker ops"
+            )
+        try:
+            labels = getattr(container, "labels", None) or {}
+            token_id = labels.get("kai.token_id", "unknown")
+            sandbox_id = labels.get("kai.sandbox_id") or getattr(container, "short_id", "unknown")
+            with self._exec_slot(token_id, sandbox_id):
+                return self._docker_exec_body(
+                    container, cmd, timeout, binary=binary, job=job, wrap_pid=not _raw
+                )
+        finally:
+            self._global_docker_sem.release()
+
+    def _docker_exec_body(
+        self,
+        container: Container,
+        cmd: list[str],
+        timeout: int,
+        *,
+        binary: bool,
+        job: BackgroundJob | None,
+        wrap_pid: bool,
+    ) -> dict[str, Any]:
         import queue
 
         pid_file: str | None = None
         run_cmd = cmd
-        if not _raw:
-            # Wrap so we always know the guest PID of the executed command.
+        if wrap_pid:
             pid_file = f"/tmp/kai-exec-{uuid.uuid4().hex[:12]}.pid"
             run_cmd = [
                 "bash",
@@ -809,6 +874,7 @@ print(dest)
                     ],
                     timeout=5,
                     _raw=True,
+                    _housekeeping=True,
                 )
             except Exception:
                 pass
