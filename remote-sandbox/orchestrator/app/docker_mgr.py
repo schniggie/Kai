@@ -23,6 +23,7 @@ MAX_STORED_JOBS_PER_SANDBOX = 32
 JOB_TTL_SECONDS = 3600
 DEFAULT_JOB_TIMEOUT_SECONDS = 3600
 MAX_SANDBOX_CONTAINERS = int(__import__("os").environ.get("MAX_SANDBOX_CONTAINERS", "16"))
+MAX_SANDBOXES_PER_TOKEN = int(__import__("os").environ.get("MAX_SANDBOXES_PER_TOKEN", "4"))
 
 
 class SandboxLimitError(RuntimeError):
@@ -97,6 +98,11 @@ class DockerManager:
             if existing >= MAX_SANDBOX_CONTAINERS:
                 raise SandboxLimitError(
                     f"at most {MAX_SANDBOX_CONTAINERS} sandbox containers allowed"
+                )
+            per_token = self._count_sandbox_containers(token_id=token_id)
+            if per_token >= MAX_SANDBOXES_PER_TOKEN:
+                raise SandboxLimitError(
+                    f"at most {MAX_SANDBOXES_PER_TOKEN} sandboxes per token"
                 )
             if not self._volume_exists(volume):
                 self.client.volumes.create(
@@ -685,14 +691,13 @@ print(dest)
                 pass
         # Fallback: nothing else we can do without container context.
 
-    def _count_sandbox_containers(self) -> int:
+    def _count_sandbox_containers(self, token_id: str | None = None) -> int:
+        """Count live sandbox containers. Idle-stopped ones are removed, so all=True is fine."""
         try:
-            return len(
-                self.client.containers.list(
-                    all=True,
-                    filters={"label": "kai.sandbox=1"},
-                )
-            )
+            filters: dict[str, Any] = {"label": ["kai.sandbox=1"]}
+            if token_id is not None:
+                filters = {"label": [f"kai.sandbox=1", f"kai.token_id={token_id}"]}
+            return len(self.client.containers.list(all=True, filters=filters))
         except APIError:
             return 0
 
@@ -736,6 +741,10 @@ print(dest)
                     container.reload()
                     if container.status == "running":
                         container.stop(timeout=10)
+                    # Remove the stopped container so it no longer occupies a
+                    # sandbox slot; the named volume keeps /root intact.
+                    container.remove(force=True)
+                    self._last_used.pop(sandbox_id, None)
                 except Exception:
                     pass
 

@@ -4,6 +4,7 @@ from app.docker_mgr import (
     MAX_FS_LIST_ENTRIES,
     MAX_JOB_OUTPUT_CHARS,
     MAX_SANDBOX_CONTAINERS,
+    MAX_SANDBOXES_PER_TOKEN,
     _truncate_chars,
 )
 
@@ -24,3 +25,5 @@ def test_cap_constants_are_finite() -> None:
     assert MAX_JOB_OUTPUT_CHARS == 100_000
     assert MAX_ACTIVE_JOBS_PER_SANDBOX == 4
     assert MAX_SANDBOX_CONTAINERS >= 1
+    assert MAX_SANDBOXES_PER_TOKEN >= 1
+    assert MAX_SANDBOXES_PER_TOKEN <= MAX_SANDBOX_CONTAINERS

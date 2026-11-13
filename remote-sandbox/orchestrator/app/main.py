@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -261,7 +262,8 @@ async def write_fs_raw(
     # Stream with a hard cap so chunked / missing Content-Length cannot buffer unbounded.
     body = await _read_body_capped(request, MAX_FS_BYTES)
     try:
-        get_docker_mgr().write_fs(token.token_id, device_id, path, body)
+        # Docker calls are blocking — keep them off the event loop.
+        await asyncio.to_thread(get_docker_mgr().write_fs, token.token_id, device_id, path, body)
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -290,7 +292,13 @@ async def write_fs_text(
     if len(encoded) > MAX_FS_BYTES:
         raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
     try:
-        get_docker_mgr().write_fs(token.token_id, device_id, body.path, encoded)
+        await asyncio.to_thread(
+            get_docker_mgr().write_fs,
+            token.token_id,
+            device_id,
+            body.path,
+            encoded,
+        )
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
