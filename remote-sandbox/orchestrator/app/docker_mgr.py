@@ -162,6 +162,11 @@ class DockerManager:
                     # Cap /tmp so guest dd/apt temp cannot fill the host disk.
                     "tmpfs": {"/tmp": "rw,nosuid,nodev,size=512m"},
                     "restart_policy": {"Name": "unless-stopped"},
+                    # Cap docker json-file logs so noisy guests cannot fill the host.
+                    "log_config": docker.types.LogConfig(
+                        type=docker.types.LogConfig.types.JSON,
+                        config={"max-size": "10m", "max-file": "3"},
+                    ),
                     # Hard container filesystem budget when the graph driver supports it.
                     "storage_opt": {"size": str(MAX_CONTAINER_BYTES)},
                 }
@@ -791,9 +796,16 @@ print(dest)
                     with buf_lock:
                         _append(stdout_b, out_part or b"")
                         _append(stderr_b, err_part or b"")
-                        # Once capped, stop reading further chunks to bound memory.
-                        if state["truncated"] and len(stdout_b) >= MAX_EXEC_OUTPUT_BYTES and len(stderr_b) >= MAX_EXEC_OUTPUT_BYTES:
-                            break
+                        hit_cap = state["truncated"]
+                    if hit_cap:
+                        # Stop consuming the docker stream once retained output is capped.
+                        try:
+                            close = getattr(stream, "close", None)
+                            if callable(close):
+                                close()
+                        except Exception:
+                            pass
+                        break
             except Exception:
                 pass
             finally:
