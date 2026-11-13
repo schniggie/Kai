@@ -13,6 +13,16 @@ import docker
 from docker.errors import APIError, NotFound
 from docker.models.containers import Container
 
+# Hard caps so one token cannot exhaust the shared orchestrator.
+MAX_FS_BYTES = 5_000_000
+MAX_FS_LIST_ENTRIES = 2_000
+MAX_EXEC_OUTPUT_BYTES = 2_000_000
+MAX_JOB_OUTPUT_CHARS = 100_000
+MAX_ACTIVE_JOBS_PER_SANDBOX = 4
+MAX_STORED_JOBS_PER_SANDBOX = 32
+JOB_TTL_SECONDS = 3600
+DEFAULT_JOB_TIMEOUT_SECONDS = 3600
+
 
 def sandbox_id_for(token_id: str, device_id: str) -> str:
     digest = hashlib.sha256(f"{token_id}:{device_id}".encode()).hexdigest()[:16]
@@ -27,6 +37,10 @@ def volume_name_for(sandbox_id: str) -> str:
     return f"kai-{sandbox_id}-data"
 
 
+class JobLimitError(RuntimeError):
+    pass
+
+
 @dataclass
 class BackgroundJob:
     job_id: str
@@ -37,6 +51,9 @@ class BackgroundJob:
     stdout: str = ""
     stderr: str = ""
     started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    exec_id: str | None = None
+    pid_file: str | None = None
 
 
 class DockerManager:
@@ -170,15 +187,24 @@ class DockerManager:
         if fresh:
             result = self._docker_exec(
                 container,
-                ["bash", "--noprofile", "--norc", "-c", wrapped],
-                timeout=timeout,
+                [
+                    "timeout",
+                    "--signal=KILL",
+                    str(timeout),
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    wrapped,
+                ],
+                timeout=timeout + 5,
             )
             self.touch(sandbox_id)
             return {
-                "stdout": result["stdout"],
-                "stderr": result["stderr"],
-                "exit_code": result["exit_code"],
-                "timed_out": result["timed_out"],
+                "stdout": _truncate_chars(result["stdout"], MAX_JOB_OUTPUT_CHARS),
+                "stderr": _truncate_chars(result["stderr"], MAX_JOB_OUTPUT_CHARS),
+                "exit_code": 124 if result["timed_out"] else result["exit_code"],
+                "timed_out": result["timed_out"] or result["exit_code"] == 124,
                 "session_id": session_id,
             }
 
@@ -199,8 +225,8 @@ class DockerManager:
             if parsed.get("ok"):
                 self.touch(sandbox_id)
                 return {
-                    "stdout": parsed.get("stdout", ""),
-                    "stderr": parsed.get("stderr", ""),
+                    "stdout": _truncate_chars(str(parsed.get("stdout", "")), MAX_JOB_OUTPUT_CHARS),
+                    "stderr": _truncate_chars(str(parsed.get("stderr", "")), MAX_JOB_OUTPUT_CHARS),
                     "exit_code": int(parsed.get("exit_code", 0)),
                     "timed_out": bool(parsed.get("timed_out", False)),
                     "session_id": session_id,
@@ -243,9 +269,25 @@ class DockerManager:
         info = self.acquire(token_id, device_id)
         sandbox_id = info["sandbox_id"]
         container = self._require_running(sandbox_id)
-        job_id = f"job_{uuid.uuid4().hex[:12]}"
-        job = BackgroundJob(job_id=job_id, sandbox_id=sandbox_id, command=command)
+        self._expire_jobs_locked(sandbox_id)
         with self._jobs_lock:
+            active = sum(
+                1
+                for j in self._jobs.values()
+                if j.sandbox_id == sandbox_id and j.status == "running"
+            )
+            if active >= MAX_ACTIVE_JOBS_PER_SANDBOX:
+                raise JobLimitError(
+                    f"at most {MAX_ACTIVE_JOBS_PER_SANDBOX} active jobs per sandbox"
+                )
+            job_id = f"job_{uuid.uuid4().hex[:12]}"
+            pid_file = f"/tmp/kai-job-{job_id}.pid"
+            job = BackgroundJob(
+                job_id=job_id,
+                sandbox_id=sandbox_id,
+                command=command,
+                pid_file=pid_file,
+            )
             self._jobs[job_id] = job
 
         def runner() -> None:
@@ -256,24 +298,35 @@ class DockerManager:
                 for key, value in env.items():
                     if key.isidentifier():
                         prefixes.append(f"export {key}={shlex.quote(value)}")
-            wrapped = " && ".join(prefixes + [f"( {command} )"]) if prefixes else command
+            inner = " && ".join(prefixes + [f"( {command} )"]) if prefixes else command
+            # Record the bash PID so kill_job can signal the real process tree.
+            wrapped = (
+                f"echo $$ > {shlex.quote(pid_file)}; "
+                f"exec bash --noprofile --norc -c {shlex.quote(inner)}"
+            )
             result = self._docker_exec(
                 container,
-                ["bash", "--noprofile", "--norc", "-c", wrapped],
-                timeout=3600,
+                ["timeout", "--signal=KILL", str(DEFAULT_JOB_TIMEOUT_SECONDS), "bash", "--noprofile", "--norc", "-c", wrapped],
+                timeout=DEFAULT_JOB_TIMEOUT_SECONDS + 5,
+                job=job,
             )
             with self._jobs_lock:
-                job.status = "finished"
+                if job.status == "killed":
+                    return
+                job.status = "timed_out" if result["timed_out"] else "finished"
                 job.exit_code = result["exit_code"]
-                job.stdout = result["stdout"]
-                job.stderr = result["stderr"]
+                job.stdout = _truncate_chars(result["stdout"], MAX_JOB_OUTPUT_CHARS)
+                job.stderr = _truncate_chars(result["stderr"], MAX_JOB_OUTPUT_CHARS)
+                job.finished_at = time.time()
             self.touch(sandbox_id)
+            self._expire_jobs_locked(sandbox_id)
 
-        threading.Thread(target=runner, daemon=True).start()
+        threading.Thread(target=runner, daemon=True, name=f"kai-job-{job_id}").start()
         self.touch(sandbox_id)
         return job
 
     def list_jobs(self, sandbox_id: str) -> list[BackgroundJob]:
+        self._expire_jobs_locked(sandbox_id)
         with self._jobs_lock:
             return [j for j in self._jobs.values() if j.sandbox_id == sandbox_id]
 
@@ -286,9 +339,30 @@ class DockerManager:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
+            sandbox_id = job.sandbox_id
+            pid_file = job.pid_file
             job.status = "killed"
             job.exit_code = -9
-            return job
+            job.finished_at = time.time()
+        container = self._get_container(container_name_for(sandbox_id))
+        if container is not None and pid_file:
+            # Best-effort: kill the recorded PID and its children.
+            self._docker_exec(
+                container,
+                [
+                    "bash",
+                    "-c",
+                    f"if [ -f {shlex.quote(pid_file)} ]; then "
+                    f"kill -TERM -$(cat {shlex.quote(pid_file)}) 2>/dev/null || "
+                    f"kill -TERM $(cat {shlex.quote(pid_file)}) 2>/dev/null; "
+                    f"sleep 0.2; "
+                    f"kill -KILL -$(cat {shlex.quote(pid_file)}) 2>/dev/null || "
+                    f"kill -KILL $(cat {shlex.quote(pid_file)}) 2>/dev/null; "
+                    f"rm -f {shlex.quote(pid_file)}; fi",
+                ],
+                timeout=10,
+            )
+        return job
 
     def remove_job(self, job_id: str) -> bool:
         with self._jobs_lock:
@@ -300,9 +374,11 @@ class DockerManager:
         script = f"""
 import json, os, sys
 path = {path!r}
+limit = {MAX_FS_LIST_ENTRIES}
 entries = []
 try:
-    for name in sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower())):
+    names = sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+    for name in names[:limit]:
         full = os.path.join(path, name)
         try:
             st = os.lstat(full)
@@ -329,28 +405,55 @@ print(json.dumps(entries))
     def read_fs(self, token_id: str, device_id: str, path: str, max_bytes: int) -> bytes:
         info = self.acquire(token_id, device_id)
         container = self._require_running(info["sandbox_id"])
+        capped = min(max(1, max_bytes), MAX_FS_BYTES)
         result = self._docker_exec(
             container,
-            ["python3", "-c", f"import sys; p={path!r}; d=open(p,'rb').read({max_bytes+1}); sys.stdout.buffer.write(d)"],
+            ["python3", "-c", f"import sys; p={path!r}; d=open(p,'rb').read({capped+1}); sys.stdout.buffer.write(d)"],
             timeout=60,
             binary=True,
         )
         self.touch(info["sandbox_id"])
         if result["exit_code"] != 0:
             raise FileNotFoundError(result["stderr"] or "read failed")
-        return result["stdout_bytes"]
+        return result["stdout_bytes"][:capped]
 
     def write_fs(self, token_id: str, device_id: str, path: str, content: bytes) -> None:
+        if len(content) > MAX_FS_BYTES:
+            raise OSError(f"payload exceeds {MAX_FS_BYTES} bytes")
         info = self.acquire(token_id, device_id)
         container = self._require_running(info["sandbox_id"])
-        b64 = __import__("base64").b64encode(content).decode("ascii")
+        # Stage as chunked base64 under /tmp so we never put multi-MB argv on
+        # the orchestrator or docker exec create call.
+        import base64
+
+        marker = f"/tmp/kai-upload-{uuid.uuid4().hex}"
+        b64 = base64.b64encode(content).decode("ascii")
+        clear = self._docker_exec(container, ["bash", "-c", f": > {shlex.quote(marker)}.b64"], timeout=10)
+        if clear["exit_code"] != 0:
+            raise OSError(clear["stderr"] or "failed to stage upload")
+        chunk_size = 48_000
+        for i in range(0, len(b64), chunk_size):
+            piece = b64[i : i + chunk_size]
+            append = self._docker_exec(
+                container,
+                ["bash", "-c", f"printf '%s' {shlex.quote(piece)} >> {shlex.quote(marker)}.b64"],
+                timeout=15,
+            )
+            if append["exit_code"] != 0:
+                self._docker_exec(container, ["rm", "-f", marker + ".b64"], timeout=10)
+                raise OSError(append["stderr"] or "failed to stage upload chunk")
         script = (
             "import base64, os\n"
             f"path = {path!r}\n"
+            f"src = {marker + '.b64'!r}\n"
             "os.makedirs(os.path.dirname(path) or '.', exist_ok=True)\n"
-            f"open(path, 'wb').write(base64.b64decode({b64!r}))\n"
+            "data = base64.b64decode(open(src, 'rb').read())\n"
+            f"if len(data) > {MAX_FS_BYTES}:\n"
+            "    raise SystemExit('payload too large')\n"
+            "open(path, 'wb').write(data)\n"
         )
         result = self._docker_exec(container, ["python3", "-c", script], timeout=60)
+        self._docker_exec(container, ["rm", "-f", marker + ".b64"], timeout=10)
         self.touch(info["sandbox_id"])
         if result["exit_code"] != 0:
             raise OSError(result["stderr"] or "write failed")
@@ -449,36 +552,101 @@ print(dest)
         cmd: list[str],
         timeout: int,
         binary: bool = False,
+        job: BackgroundJob | None = None,
     ) -> dict[str, Any]:
-        # docker-py exec_run has no timeout; use the low-level API + deadline.
-        exec_id = self.client.api.exec_create(container.id, cmd, stdout=True, stderr=True)["Id"]
-        output = self.client.api.exec_start(exec_id, demux=True)
-        # exec_start is blocking; demux returns (stdout, stderr) once finished.
-        # For long jobs we accept docker's blocking behavior; caller chooses timeout
-        # for session commands by asking sessiond to enforce it.
-        stdout_b, stderr_b = output if isinstance(output, tuple) else (output, b"")
-        stdout_b = stdout_b or b""
-        stderr_b = stderr_b or b""
+        """Run a command with a wall-clock deadline and a hard output byte cap."""
+        exec_id = self.client.api.exec_create(
+            container.id,
+            cmd,
+            stdout=True,
+            stderr=True,
+        )["Id"]
+        if job is not None:
+            with self._jobs_lock:
+                job.exec_id = exec_id
+
+        stream = self.client.api.exec_start(exec_id, demux=True, stream=True)
+        stdout_b = bytearray()
+        stderr_b = bytearray()
+        timed_out = False
+        truncated = False
+        deadline = time.time() + max(1, timeout)
+
+        try:
+            for chunk in stream:
+                if time.time() > deadline:
+                    timed_out = True
+                    break
+                if not chunk:
+                    continue
+                out_part, err_part = chunk if isinstance(chunk, tuple) else (chunk, b"")
+                if out_part:
+                    if len(stdout_b) < MAX_EXEC_OUTPUT_BYTES:
+                        remain = MAX_EXEC_OUTPUT_BYTES - len(stdout_b)
+                        stdout_b.extend(out_part[:remain])
+                        if len(out_part) > remain:
+                            truncated = True
+                    else:
+                        truncated = True
+                if err_part:
+                    if len(stderr_b) < MAX_EXEC_OUTPUT_BYTES:
+                        remain = MAX_EXEC_OUTPUT_BYTES - len(stderr_b)
+                        stderr_b.extend(err_part[:remain])
+                        if len(err_part) > remain:
+                            truncated = True
+                    else:
+                        truncated = True
+        except Exception:
+            pass
+
         inspect = self.client.api.exec_inspect(exec_id)
+        running = bool(inspect.get("Running"))
         exit_code = int(inspect.get("ExitCode") or 0)
+        if timed_out or running:
+            timed_out = True
+            exit_code = 124
+        if truncated and not binary:
+            stderr_b.extend(b"\n[kai] output truncated\n")
         if binary:
             return {
-                "stdout_bytes": stdout_b,
+                "stdout_bytes": bytes(stdout_b),
                 "stdout": "",
-                "stderr": stderr_b.decode("utf-8", "replace"),
+                "stderr": bytes(stderr_b).decode("utf-8", "replace"),
                 "exit_code": exit_code,
-                "timed_out": False,
+                "timed_out": timed_out,
             }
         return {
-            "stdout": stdout_b.decode("utf-8", "replace"),
-            "stderr": stderr_b.decode("utf-8", "replace"),
+            "stdout": bytes(stdout_b).decode("utf-8", "replace"),
+            "stderr": bytes(stderr_b).decode("utf-8", "replace"),
             "exit_code": exit_code,
-            "timed_out": False,
+            "timed_out": timed_out,
         }
+
+    def _expire_jobs_locked(self, sandbox_id: str) -> None:
+        now = time.time()
+        with self._jobs_lock:
+            owned = [j for j in self._jobs.values() if j.sandbox_id == sandbox_id]
+            for job in owned:
+                if job.status == "running":
+                    continue
+                finished = job.finished_at or job.started_at
+                if now - finished > JOB_TTL_SECONDS:
+                    self._jobs.pop(job.job_id, None)
+            owned = [j for j in self._jobs.values() if j.sandbox_id == sandbox_id]
+            finished = sorted(
+                (j for j in owned if j.status != "running"),
+                key=lambda j: j.finished_at or j.started_at,
+            )
+            overflow = len(finished) - (MAX_STORED_JOBS_PER_SANDBOX - MAX_ACTIVE_JOBS_PER_SANDBOX)
+            for job in finished[: max(0, overflow)]:
+                self._jobs.pop(job.job_id, None)
 
     def _idle_reaper(self) -> None:
         while True:
             time.sleep(60)
+            # Drop expired job records globally.
+            for sandbox_id in {j.sandbox_id for j in list(self._jobs.values())}:
+                self._expire_jobs_locked(sandbox_id)
             if self.idle_timeout_seconds <= 0:
                 continue
             now = time.time()
@@ -496,3 +664,9 @@ print(dest)
                         container.stop(timeout=10)
                 except Exception:
                     pass
+
+
+def _truncate_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n[kai] output truncated\n"

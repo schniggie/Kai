@@ -35,6 +35,7 @@ This feature is aimed at a private group. Without an Apple Developer Program mem
 - Terminal streaming is request/response (output arrives when the command finishes), not a live PTY.
 - Apt packages live in the container layer: they survive stop/start, but a wipe recreates a clean image plus the `/root` volume only.
 - Full root is intentional for a trusted group — isolate the Docker host accordingly.
+- Shared-orchestrator caps apply: 5 MiB file payloads, 2000-entry directory listings, 4 active background jobs per sandbox, truncated command output, and wall-clock timeouts on exec.
 
 ## Key Files
 

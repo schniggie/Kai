@@ -64,9 +64,11 @@ class FsListResponse(BaseModel):
 
 
 class FsWriteRequest(BaseModel):
-    path: str
-    content: str
-    encoding: str = "utf-8"
+    path: str = Field(min_length=1, max_length=4096)
+    # Cap matches orchestrator MAX_FS_BYTES (5 MiB). Characters ≈ bytes for UTF-8
+    # ASCII; non-ASCII is rejected later by the encoded-length check in the route.
+    content: str = Field(default="", max_length=5_000_000)
+    encoding: str = Field(default="utf-8", max_length=32)
 
 
 class ErrorResponse(BaseModel):

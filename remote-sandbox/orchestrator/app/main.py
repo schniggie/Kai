@@ -7,7 +7,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from .auth import Token, TokenStore
-from .docker_mgr import DockerManager, sandbox_id_for
+from .docker_mgr import (
+    MAX_FS_BYTES,
+    DockerManager,
+    JobLimitError,
+    sandbox_id_for,
+)
 from .models import (
     AcquireRequest,
     ErrorResponse,
@@ -118,13 +123,18 @@ def start_job(
     body: JobStartRequest,
     token: Token = Depends(current_token),
 ) -> JobResponse:
-    job = docker_mgr.start_job(
-        token.token_id,
-        device_id,
-        body.command,
-        body.working_dir,
-        body.env,
-    )
+    try:
+        job = docker_mgr.start_job(
+            token.token_id,
+            device_id,
+            body.command,
+            body.working_dir,
+            body.env,
+        )
+    except JobLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return JobResponse(
         job_id=job.job_id,
         status=job.status,
@@ -228,7 +238,16 @@ async def write_fs_raw(
     token: Token = Depends(current_token),
 ) -> dict[str, bool]:
     _assert_safe_path(path)
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_FS_BYTES:
+                raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content-length") from exc
     body = await request.body()
+    if len(body) > MAX_FS_BYTES:
+        raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
     try:
         docker_mgr.write_fs(token.token_id, device_id, path, body)
         return {"ok": True}
@@ -244,7 +263,15 @@ def write_fs_text(
 ) -> dict[str, bool]:
     _assert_safe_path(body.path)
     try:
-        docker_mgr.write_fs(token.token_id, device_id, body.path, body.content.encode(body.encoding))
+        encoded = body.content.encode(body.encoding)
+    except LookupError as exc:
+        raise HTTPException(status_code=400, detail=f"unknown encoding: {body.encoding}") from exc
+    except UnicodeEncodeError as exc:
+        raise HTTPException(status_code=400, detail="content encoding failed") from exc
+    if len(encoded) > MAX_FS_BYTES:
+        raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
+    try:
+        docker_mgr.write_fs(token.token_id, device_id, body.path, encoded)
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

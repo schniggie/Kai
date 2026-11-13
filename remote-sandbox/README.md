@@ -89,6 +89,7 @@ Persistent sessions keep cwd/env across calls (per `session_id`). `fresh: true` 
 
 - Full root inside the container is intentional.
 - Cap CPU/memory on containers (defaults: 2 CPU, 2 GB).
+- Orchestrator caps: FS read/write ≤ 5 MiB, directory listings ≤ 2000 entries, ≤ 4 active jobs per sandbox, truncated command/job output, wall-clock `timeout` on exec/jobs, `kill` signals the real PID tree, finished jobs expire after 1h.
 - Keep the orchestrator on a private network / VPN when possible.
 - Rotate tokens by editing `tokens.txt` (hot-reloaded on next auth miss).
 - Assume a compromised token can attack other containers on `kai_sandbox_net` and the host’s reachable network — isolate accordingly.
