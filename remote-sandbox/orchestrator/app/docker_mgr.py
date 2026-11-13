@@ -75,6 +75,7 @@ class DockerManager:
         self.idle_timeout_seconds = idle_timeout_seconds
         self._jobs: dict[str, BackgroundJob] = {}
         self._jobs_lock = threading.Lock()
+        self._provision_lock = threading.Lock()
         self._last_used: dict[str, float] = {}
         self._ensure_network()
         threading.Thread(target=self._idle_reaper, daemon=True).start()
@@ -90,52 +91,64 @@ class DockerManager:
         name = container_name_for(sandbox_id)
         volume = volume_name_for(sandbox_id)
 
-        container = self._get_container(name)
-        if container is None:
-            # Count before creating either the volume or the container so a
-            # rejected acquire cannot leave orphan volumes behind.
-            existing = self._count_sandbox_containers()
-            if existing >= MAX_SANDBOX_CONTAINERS:
-                raise SandboxLimitError(
-                    f"at most {MAX_SANDBOX_CONTAINERS} sandbox containers allowed"
-                )
-            per_token = self._count_sandbox_containers(token_id=token_id)
-            if per_token >= MAX_SANDBOXES_PER_TOKEN:
-                raise SandboxLimitError(
-                    f"at most {MAX_SANDBOXES_PER_TOKEN} sandboxes per token"
-                )
-            if not self._volume_exists(volume):
-                self.client.volumes.create(
-                    name=volume,
+        with self._provision_lock:
+            container = self._get_container(name)
+            if container is None:
+                # Count+create is locked so concurrent acquires cannot bypass caps.
+                existing = self._count_sandbox_containers()
+                if existing >= MAX_SANDBOX_CONTAINERS:
+                    raise SandboxLimitError(
+                        f"at most {MAX_SANDBOX_CONTAINERS} sandbox containers allowed"
+                    )
+                per_token = self._count_sandbox_containers(token_id=token_id)
+                if per_token >= MAX_SANDBOXES_PER_TOKEN:
+                    raise SandboxLimitError(
+                        f"at most {MAX_SANDBOXES_PER_TOKEN} sandboxes per token"
+                    )
+                if not self._volume_exists(volume):
+                    vol_total = self._count_sandbox_volumes()
+                    vol_token = self._count_sandbox_volumes(token_id=token_id)
+                    if vol_total >= MAX_SANDBOX_CONTAINERS:
+                        raise SandboxLimitError(
+                            f"at most {MAX_SANDBOX_CONTAINERS} sandbox volumes allowed; "
+                            "DELETE with wipe=true to free one"
+                        )
+                    if vol_token >= MAX_SANDBOXES_PER_TOKEN:
+                        raise SandboxLimitError(
+                            f"at most {MAX_SANDBOXES_PER_TOKEN} volumes per token; "
+                            "DELETE with wipe=true to free one"
+                        )
+                    self.client.volumes.create(
+                        name=volume,
+                        labels={
+                            "kai.sandbox": "1",
+                            "kai.sandbox_id": sandbox_id,
+                            "kai.token_id": token_id,
+                            "kai.device_id": device_id,
+                        },
+                    )
+                container = self.client.containers.run(
+                    image=self.image,
+                    name=name,
+                    detach=True,
+                    tty=False,
+                    stdin_open=False,
+                    network=self.network_name,
+                    volumes={volume: {"bind": "/root", "mode": "rw"}},
                     labels={
                         "kai.sandbox": "1",
                         "kai.sandbox_id": sandbox_id,
                         "kai.token_id": token_id,
                         "kai.device_id": device_id,
                     },
+                    mem_limit="2g",
+                    nano_cpus=2_000_000_000,
+                    restart_policy={"Name": "unless-stopped"},
                 )
-            container = self.client.containers.run(
-                image=self.image,
-                name=name,
-                detach=True,
-                tty=False,
-                stdin_open=False,
-                network=self.network_name,
-                volumes={volume: {"bind": "/root", "mode": "rw"}},
-                labels={
-                    "kai.sandbox": "1",
-                    "kai.sandbox_id": sandbox_id,
-                    "kai.token_id": token_id,
-                    "kai.device_id": device_id,
-                },
-                mem_limit="2g",
-                nano_cpus=2_000_000_000,
-                restart_policy={"Name": "unless-stopped"},
-            )
-        else:
-            container.reload()
-            if container.status != "running":
-                container.start()
+            else:
+                container.reload()
+                if container.status != "running":
+                    container.start()
 
         self._wait_ready(container)
         self.touch(sandbox_id)
@@ -579,17 +592,33 @@ print(dest)
         timeout: int,
         binary: bool = False,
         job: BackgroundJob | None = None,
+        _raw: bool = False,
     ) -> dict[str, Any]:
         """Run a command with a wall-clock deadline and a hard output byte cap.
 
         The stream reader runs on a side thread so a silent (no-output) command
-        still hits the deadline — a plain `for chunk in stream` would block forever.
+        still hits the deadline. Guest PID is recorded so timeout kill works
+        inside the container namespace (host os.kill is unreliable for execs).
         """
         import queue
 
+        pid_file: str | None = None
+        run_cmd = cmd
+        if not _raw:
+            # Wrap so we always know the guest PID of the executed command.
+            pid_file = f"/tmp/kai-exec-{uuid.uuid4().hex[:12]}.pid"
+            run_cmd = [
+                "bash",
+                "-c",
+                'echo $$ > "$1"; shift; exec "$@"',
+                "kai-exec",
+                pid_file,
+                *cmd,
+            ]
+
         exec_id = self.client.api.exec_create(
             container.id,
-            cmd,
+            run_cmd,
             stdout=True,
             stderr=True,
         )["Id"]
@@ -657,7 +686,13 @@ print(dest)
         if timed_out or running:
             timed_out = True
             exit_code = 124
-            self._kill_exec(inspect)
+            self._kill_exec(container, inspect, pid_file)
+            try:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
         if truncated and not binary:
             stderr_b.extend(b"\n[kai] output truncated\n")
         if binary:
@@ -675,29 +710,58 @@ print(dest)
             "timed_out": timed_out,
         }
 
-    def _kill_exec(self, inspect: dict[str, Any]) -> None:
+    def _kill_exec(
+        self,
+        container: Container,
+        inspect: dict[str, Any],
+        pid_file: str | None,
+    ) -> None:
         """Stop a still-running docker exec after a stream deadline."""
         import os
         import signal
 
+        # Prefer in-container kill via the guest PID file — works regardless of
+        # whether ExecInspect.Pid is visible in the orchestrator PID namespace.
+        if pid_file:
+            try:
+                self._docker_exec(
+                    container,
+                    [
+                        "bash",
+                        "-c",
+                        f"if [ -f {shlex.quote(pid_file)} ]; then "
+                        f"kill -KILL -$(cat {shlex.quote(pid_file)}) 2>/dev/null || "
+                        f"kill -KILL $(cat {shlex.quote(pid_file)}) 2>/dev/null; "
+                        f"rm -f {shlex.quote(pid_file)}; fi",
+                    ],
+                    timeout=5,
+                    _raw=True,
+                )
+            except Exception:
+                pass
         pid = inspect.get("Pid")
         if isinstance(pid, int) and pid > 1:
             try:
                 os.kill(pid, signal.SIGKILL)
-                return
-            except ProcessLookupError:
-                return
-            except PermissionError:
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
-        # Fallback: nothing else we can do without container context.
 
     def _count_sandbox_containers(self, token_id: str | None = None) -> int:
         """Count live sandbox containers. Idle-stopped ones are removed, so all=True is fine."""
         try:
-            filters: dict[str, Any] = {"label": ["kai.sandbox=1"]}
+            labels = ["kai.sandbox=1"]
             if token_id is not None:
-                filters = {"label": [f"kai.sandbox=1", f"kai.token_id={token_id}"]}
-            return len(self.client.containers.list(all=True, filters=filters))
+                labels.append(f"kai.token_id={token_id}")
+            return len(self.client.containers.list(all=True, filters={"label": labels}))
+        except APIError:
+            return 0
+
+    def _count_sandbox_volumes(self, token_id: str | None = None) -> int:
+        try:
+            labels = ["kai.sandbox=1"]
+            if token_id is not None:
+                labels.append(f"kai.token_id={token_id}")
+            return len(self.client.volumes.list(filters={"label": labels}))
         except APIError:
             return 0
 
