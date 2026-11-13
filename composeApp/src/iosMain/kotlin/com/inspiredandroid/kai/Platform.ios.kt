@@ -13,6 +13,8 @@ import com.inspiredandroid.kai.mcp.McpServerManager
 import com.inspiredandroid.kai.network.tools.Tool
 import com.inspiredandroid.kai.network.tools.ToolInfo
 import com.inspiredandroid.kai.tools.CommonTools
+import com.inspiredandroid.kai.tools.RemoteSandboxProcessTool
+import com.inspiredandroid.kai.tools.RemoteSandboxShellTool
 import com.inspiredandroid.kai.tools.buildAgentToolSet
 import com.inspiredandroid.kai.ui.icons.ArrowBackIos
 import com.russhwolf.settings.ExperimentalSettingsImplementation
@@ -125,7 +127,8 @@ actual fun createSecureSettings(): Settings = KeychainSettings(service = "com.in
 
 actual fun createLegacySettings(): Settings? = NSUserDefaultsSettings(platform.Foundation.NSUserDefaults.standardUserDefaults)
 
-actual fun getPlatformToolDefinitions(): List<ToolInfo> = CommonTools.commonToolDefinitions
+actual fun getPlatformToolDefinitions(): List<ToolInfo> = CommonTools.commonToolDefinitions +
+    listOf(RemoteSandboxShellTool.toolInfo, RemoteSandboxProcessTool.toolInfo)
 
 private object IosKoinHelper : KoinComponent {
     val appSettings: AppSettings by inject()
@@ -133,6 +136,7 @@ private object IosKoinHelper : KoinComponent {
     val taskStore: TaskStore by inject()
     val emailStore: EmailStore by inject()
     val mcpServerManager: McpServerManager by inject()
+    val sandboxController: SandboxController by inject()
 }
 
 actual fun getAvailableTools(): List<Tool> = buildAgentToolSet(
@@ -141,7 +145,14 @@ actual fun getAvailableTools(): List<Tool> = buildAgentToolSet(
     taskStore = IosKoinHelper.taskStore,
     mcpServerManager = IosKoinHelper.mcpServerManager,
     emailStore = IosKoinHelper.emailStore,
-)
+) {
+    if (IosKoinHelper.appSettings.isSandboxEnabled() &&
+        IosKoinHelper.sandboxController.status.value.ready
+    ) {
+        add(RemoteSandboxShellTool)
+        add(RemoteSandboxProcessTool)
+    }
+}
 
 @Suppress("CAST_NEVER_SUCCEEDS")
 actual fun openUrl(url: String): Boolean = try {

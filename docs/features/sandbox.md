@@ -1,10 +1,10 @@
 # Linux Sandbox
 
-**Last verified:** 2026-10-02
+**Last verified:** 2026-11-13
 
 Kai ships a self-contained Linux environment on Android so the assistant — and the user, via the in-app Terminal — can run real shell commands. The agent can install packages, write and run scripts, hit the network, and reach external servers over SSH/SFTP/FTP. The sandbox runs the user-space `proot` runtime against a rootfs extracted into the app's private storage; no root or system access is required.
 
-The sandbox is **Android-only**. iOS, desktop, and web have no-op stubs — sandbox operations are simply unavailable on those platforms.
+On **iOS**, the same chat Terminal / Files / agent shell tools are backed by a [remote Docker sandbox](remote-sandbox.md) (one Debian container per device) instead of proot. Desktop and web still have no-op stubs.
 
 ## Concepts
 
@@ -154,7 +154,7 @@ The shell session can break — the user types `exit`, a command crashes bash, t
 - **Memory cost of multiple sessions.** Each live shell is a `proot+bash` pair (tens of MB resident). Running many concurrent chats with shell-tool usage will accumulate sessions. There is no soft cap yet — closing a conversation drops its shell, sandbox reset drops them all.
 - **Cancel without a PTY is best-effort.** A child that ignores `SIGINT`/`SIGTERM` forces a session reset; the user loses session state for that one command.
 - **Stray output from backgrounded jobs** (`sleep 60 &` then "Done" later) can attach itself to whatever command is running when the kernel finally reports the exit. Matches normal terminal behavior.
-- **iOS / desktop / web**: no sandbox. Stubs are no-ops — calls return empty results (or are simply unsupported) until those platforms get their own runtime.
+- **iOS**: uses the [remote Docker sandbox](remote-sandbox.md) instead of on-device proot. Desktop and web still have no-op stubs.
 
 ## Key Files
 

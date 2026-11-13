@@ -467,6 +467,25 @@ class FakeDataRepository : DataRepository {
         storedSandboxDistro = distro
     }
 
+    var remoteSandboxUrl: String = ""
+    var remoteSandboxToken: String = ""
+    var remoteSandboxDeviceId: String = "test-device"
+
+    override fun getRemoteSandboxUrl(): String = remoteSandboxUrl
+    override fun setRemoteSandboxUrl(url: String) {
+        remoteSandboxUrl = url
+    }
+    override fun getRemoteSandboxToken(): String = remoteSandboxToken
+    override fun setRemoteSandboxToken(token: String) {
+        remoteSandboxToken = token
+    }
+    override fun getRemoteSandboxDeviceId(): String = remoteSandboxDeviceId
+    override fun setRemoteSandboxDeviceId(deviceId: String) {
+        remoteSandboxDeviceId = deviceId
+    }
+    override fun isRemoteSandboxConfigured(): Boolean =
+        remoteSandboxUrl.isNotBlank() && remoteSandboxToken.isNotBlank()
+
     var storedKaiBuildLaunchAgent: String? = null
 
     override fun getKaiBuildLaunchAgent(): String? = storedKaiBuildLaunchAgent

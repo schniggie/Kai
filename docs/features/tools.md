@@ -1,6 +1,6 @@
 # Tools
 
-**Last verified:** 2026-10-02
+**Last verified:** 2026-11-13
 
 Kai's tools feature allows the AI to execute external functions during conversations — web search, notifications, calendar events, shell commands, memory operations, and more. Tools are defined with a schema, executed with safety guards, and managed through per-tool toggles in settings.
 
@@ -104,7 +104,9 @@ SMS tools (`check_sms`, `read_sms`, `search_sms`, `send_sms`, `reply_sms`) and n
 
 #### Linux Sandbox (Android)
 
-When the Linux Sandbox is set up and enabled, `execute_shell_command` routes commands through proot into a Debian or Alpine rootfs instead of running them in Android's native shell. This provides:
+On **iOS**, the same tool names are backed by the [remote Docker sandbox](remote-sandbox.md) when Settings → Sandbox is Connected — a per-device Debian container with root, not proot.
+
+When the Android Linux Sandbox is set up and enabled, `execute_shell_command` routes commands through proot into a Debian or Alpine rootfs instead of running them in Android's native shell. This provides:
 
 - A full Linux userland with bash, coreutils, and standard utilities
 - Package management via `apt` (Debian) or `apk` (Alpine)

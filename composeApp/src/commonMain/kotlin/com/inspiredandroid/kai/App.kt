@@ -214,7 +214,8 @@ private fun AppContent(
                             onNavigateToSettings = {
                                 navController.navigate(Settings)
                             },
-                            isSandboxAvailable = currentPlatform is Platform.Mobile.Android,
+                            isSandboxAvailable = currentPlatform is Platform.Mobile.Android ||
+                                currentPlatform is Platform.Mobile.Ios,
                             isKaiBuildAvailable = currentPlatform is Platform.Mobile.Android,
                             navigationTabBar = if (showTabBar) navigationTabBar else null,
                         )

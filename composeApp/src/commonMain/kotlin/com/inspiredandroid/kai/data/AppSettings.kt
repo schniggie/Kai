@@ -350,6 +350,43 @@ class AppSettings(internal val settings: Settings) {
         settings.putString(KEY_SANDBOX_DISTRO, distro.id)
     }
 
+    /** Base URL of the remote sandbox orchestrator (no trailing slash). */
+    fun getRemoteSandboxUrl(): String = settings.getString(KEY_REMOTE_SANDBOX_URL, "")
+
+    fun setRemoteSandboxUrl(url: String) {
+        settings.putString(KEY_REMOTE_SANDBOX_URL, url.trim())
+    }
+
+    /** Bearer token secret from the orchestrator's tokens file. */
+    fun getRemoteSandboxToken(): String = settings.getString(KEY_REMOTE_SANDBOX_TOKEN, "")
+
+    fun setRemoteSandboxToken(token: String) {
+        settings.putString(KEY_REMOTE_SANDBOX_TOKEN, token.trim())
+    }
+
+    /**
+     * Stable per-install device id. Together with the token id on the server this
+     * selects which container the phone owns.
+     */
+    @OptIn(kotlin.uuid.ExperimentalUuidApi::class)
+    fun getOrCreateRemoteSandboxDeviceId(): String {
+        val existing = settings.getStringOrNull(KEY_REMOTE_SANDBOX_DEVICE_ID)?.takeIf { it.isNotBlank() }
+        if (existing != null) return existing
+        val created = kotlin.uuid.Uuid.random().toString()
+        settings.putString(KEY_REMOTE_SANDBOX_DEVICE_ID, created)
+        return created
+    }
+
+    fun getRemoteSandboxDeviceId(): String = getOrCreateRemoteSandboxDeviceId()
+
+    fun setRemoteSandboxDeviceId(deviceId: String) {
+        val trimmed = deviceId.trim()
+        if (trimmed.isNotEmpty()) settings.putString(KEY_REMOTE_SANDBOX_DEVICE_ID, trimmed)
+    }
+
+    fun isRemoteSandboxConfigured(): Boolean =
+        getRemoteSandboxUrl().isNotBlank() && getRemoteSandboxToken().isNotBlank()
+
     /**
      * Kai Build's "Open with" choice — the agent a freshly opened project starts,
      * or null for a plain shell. Stored as an empty string so "never picked" and
@@ -624,6 +661,9 @@ class AppSettings(internal val settings: Settings) {
 
         const val KEY_SANDBOX_ENABLED = "sandbox_enabled"
         const val KEY_SANDBOX_DISTRO = "sandbox_distro"
+        const val KEY_REMOTE_SANDBOX_URL = "remote_sandbox_url"
+        const val KEY_REMOTE_SANDBOX_TOKEN = "remote_sandbox_token"
+        const val KEY_REMOTE_SANDBOX_DEVICE_ID = "remote_sandbox_device_id"
         const val KEY_KAI_BUILD_LAUNCH_AGENT = "kai_build_launch_agent"
 
         // Basic memory guidance shared by every chat variant. The advanced `## Structured

@@ -1977,6 +1977,26 @@ class RemoteDataRepository(
         appSettings.setSandboxDistro(distro)
     }
 
+    override fun getRemoteSandboxUrl(): String = appSettings.getRemoteSandboxUrl()
+
+    override fun setRemoteSandboxUrl(url: String) {
+        appSettings.setRemoteSandboxUrl(url)
+    }
+
+    override fun getRemoteSandboxToken(): String = appSettings.getRemoteSandboxToken()
+
+    override fun setRemoteSandboxToken(token: String) {
+        appSettings.setRemoteSandboxToken(token)
+    }
+
+    override fun getRemoteSandboxDeviceId(): String = appSettings.getRemoteSandboxDeviceId()
+
+    override fun setRemoteSandboxDeviceId(deviceId: String) {
+        appSettings.setRemoteSandboxDeviceId(deviceId)
+    }
+
+    override fun isRemoteSandboxConfigured(): Boolean = appSettings.isRemoteSandboxConfigured()
+
     override fun getKaiBuildLaunchAgent(): String? = appSettings.getKaiBuildLaunchAgent()
 
     override fun setKaiBuildLaunchAgent(agentId: String?) {

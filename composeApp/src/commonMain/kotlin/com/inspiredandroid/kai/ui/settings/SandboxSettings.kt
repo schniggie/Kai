@@ -27,6 +27,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.inspiredandroid.kai.formatFileSize
 import com.inspiredandroid.kai.linux.LinuxDistro
+import com.inspiredandroid.kai.ui.KaiOutlinedTextField
 import com.inspiredandroid.kai.ui.handCursor
 import com.inspiredandroid.kai.ui.sandbox.SandboxProgressRow
 import com.inspiredandroid.kai.ui.sandbox.sandboxStatusText
@@ -46,6 +47,13 @@ import kai.composeapp.generated.resources.settings_sandbox_install_packages
 import kai.composeapp.generated.resources.settings_sandbox_migrate_action
 import kai.composeapp.generated.resources.settings_sandbox_migrate_detail
 import kai.composeapp.generated.resources.settings_sandbox_migrate_title
+import kai.composeapp.generated.resources.settings_sandbox_remote_connect
+import kai.composeapp.generated.resources.settings_sandbox_remote_description
+import kai.composeapp.generated.resources.settings_sandbox_remote_device_id
+import kai.composeapp.generated.resources.settings_sandbox_remote_disconnect
+import kai.composeapp.generated.resources.settings_sandbox_remote_title
+import kai.composeapp.generated.resources.settings_sandbox_remote_token
+import kai.composeapp.generated.resources.settings_sandbox_remote_url
 import kai.composeapp.generated.resources.settings_sandbox_uninstall
 import kai.composeapp.generated.resources.settings_sandbox_uninstall_confirm
 import kai.composeapp.generated.resources.settings_sandbox_uninstall_confirm_shared
@@ -61,6 +69,9 @@ internal fun SandboxSettingsCard(
     onResetSandbox: () -> Unit,
     onInstallPackages: () -> Unit,
     onMigrateHome: () -> Unit,
+    onRemoteUrlChange: (String) -> Unit = {},
+    onRemoteTokenChange: (String) -> Unit = {},
+    onRemoteDeviceIdChange: (String) -> Unit = {},
 ) {
     var showResetDialog by remember { mutableStateOf(false) }
     val statusText = sandboxStatusText(sandboxState.sandboxStatusLabel)
@@ -72,8 +83,11 @@ internal fun SandboxSettingsCard(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    // Before install this names what would be installed; after, what is.
-                    text = sandboxState.distro.displayName,
+                    text = if (sandboxState.isRemote) {
+                        stringResource(Res.string.settings_sandbox_remote_title)
+                    } else {
+                        sandboxState.distro.displayName
+                    },
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
@@ -88,7 +102,13 @@ internal fun SandboxSettingsCard(
                 } else {
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = stringResource(Res.string.settings_sandbox_description),
+                        text = stringResource(
+                            if (sandboxState.isRemote) {
+                                Res.string.settings_sandbox_remote_description
+                            } else {
+                                Res.string.settings_sandbox_description
+                            },
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -102,9 +122,36 @@ internal fun SandboxSettingsCard(
             }
         }
 
-        // Offered at any time: each distribution keeps its own install, so this
-        // picks which one the shell integration runs in rather than replacing it.
-        if (!sandboxState.isWorking) {
+        if (sandboxState.isRemote) {
+            Spacer(Modifier.height(12.dp))
+            KaiOutlinedTextField(
+                value = sandboxState.remoteUrl,
+                onValueChange = onRemoteUrlChange,
+                label = { Text(stringResource(Res.string.settings_sandbox_remote_url)) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                enabled = !sandboxState.isWorking,
+            )
+            Spacer(Modifier.height(8.dp))
+            KaiOutlinedTextField(
+                value = sandboxState.remoteToken,
+                onValueChange = onRemoteTokenChange,
+                label = { Text(stringResource(Res.string.settings_sandbox_remote_token)) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                enabled = !sandboxState.isWorking,
+            )
+            Spacer(Modifier.height(8.dp))
+            KaiOutlinedTextField(
+                value = sandboxState.remoteDeviceId,
+                onValueChange = onRemoteDeviceIdChange,
+                label = { Text(stringResource(Res.string.settings_sandbox_remote_device_id)) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                enabled = !sandboxState.isWorking,
+            )
+        } else if (!sandboxState.isWorking) {
+            // Local Android: each distribution keeps its own install.
             DistroPicker(
                 selected = sandboxState.distro,
                 installed = sandboxState.installedDistros,
@@ -162,7 +209,15 @@ internal fun SandboxSettingsCard(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!sandboxState.sandboxReady) {
                     Button(onClick = onSetupSandbox, modifier = Modifier.handCursor()) {
-                        Text(stringResource(Res.string.settings_sandbox_install))
+                        Text(
+                            stringResource(
+                                if (sandboxState.isRemote) {
+                                    Res.string.settings_sandbox_remote_connect
+                                } else {
+                                    Res.string.settings_sandbox_install
+                                },
+                            ),
+                        )
                     }
                 } else {
                     if (!sandboxState.sandboxPackagesInstalled) {
@@ -171,7 +226,15 @@ internal fun SandboxSettingsCard(
                         }
                     }
                     OutlinedButton(onClick = { showResetDialog = true }, modifier = Modifier.handCursor()) {
-                        Text(stringResource(Res.string.settings_sandbox_uninstall))
+                        Text(
+                            stringResource(
+                                if (sandboxState.isRemote) {
+                                    Res.string.settings_sandbox_remote_disconnect
+                                } else {
+                                    Res.string.settings_sandbox_uninstall
+                                },
+                            ),
+                        )
                     }
                 }
             }
@@ -181,14 +244,22 @@ internal fun SandboxSettingsCard(
     if (showResetDialog) {
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
-            title = { Text(stringResource(Res.string.settings_sandbox_uninstall)) },
+            title = {
+                Text(
+                    stringResource(
+                        if (sandboxState.isRemote) {
+                            Res.string.settings_sandbox_remote_disconnect
+                        } else {
+                            Res.string.settings_sandbox_uninstall
+                        },
+                    ),
+                )
+            },
             text = {
-                // A Debian sandbox is the same install Kai Build works in, so
-                // uninstalling here takes Kai Build's Linux with it.
-                val confirm = if (sandboxState.distro == LinuxDistro.DEBIAN) {
-                    Res.string.settings_sandbox_uninstall_confirm_shared
-                } else {
-                    Res.string.settings_sandbox_uninstall_confirm
+                val confirm = when {
+                    sandboxState.isRemote -> Res.string.settings_sandbox_uninstall_confirm
+                    sandboxState.distro == LinuxDistro.DEBIAN -> Res.string.settings_sandbox_uninstall_confirm_shared
+                    else -> Res.string.settings_sandbox_uninstall_confirm
                 }
                 Text(stringResource(confirm))
             },
@@ -200,7 +271,15 @@ internal fun SandboxSettingsCard(
                     },
                     modifier = Modifier.handCursor(),
                 ) {
-                    Text(stringResource(Res.string.settings_sandbox_uninstall))
+                    Text(
+                        stringResource(
+                            if (sandboxState.isRemote) {
+                                Res.string.settings_sandbox_remote_disconnect
+                            } else {
+                                Res.string.settings_sandbox_uninstall
+                            },
+                        ),
+                    )
                 }
             },
             dismissButton = {

@@ -19,6 +19,8 @@ import kotlinx.coroutines.launch
 @Immutable
 data class SandboxUiState(
     val showSandbox: Boolean = false,
+    /** True on iOS (and any target that uses the Docker orchestrator instead of proot). */
+    val isRemote: Boolean = false,
     val sandboxInstalled: Boolean = false,
     val sandboxReady: Boolean = false,
     val sandboxProgress: Float? = null,
@@ -38,6 +40,9 @@ data class SandboxUiState(
     val installedDistros: Set<LinuxDistro> = emptySet(),
     /** Files the other install has and this one does not; null when there are none. */
     val migration: SandboxMigration? = null,
+    val remoteUrl: String = "",
+    val remoteToken: String = "",
+    val remoteDeviceId: String = "",
 )
 
 class SandboxViewModel(
@@ -56,8 +61,13 @@ class SandboxViewModel(
             // install the sandbox is actually pointed at, and a sandbox older
             // than the picker has one the stored setting does not name.
             SandboxUiState(
-                showSandbox = currentPlatform is Platform.Mobile.Android,
+                showSandbox = currentPlatform is Platform.Mobile.Android ||
+                    currentPlatform is Platform.Mobile.Ios,
+                isRemote = currentPlatform is Platform.Mobile.Ios,
                 isSandboxEnabled = dataRepository.isSandboxEnabled(),
+                remoteUrl = dataRepository.getRemoteSandboxUrl(),
+                remoteToken = dataRepository.getRemoteSandboxToken(),
+                remoteDeviceId = dataRepository.getRemoteSandboxDeviceId(),
             ),
         ),
     )
@@ -130,5 +140,20 @@ class SandboxViewModel(
      */
     fun onMigrateHome() {
         sandboxController.migrateHome()
+    }
+
+    fun onRemoteUrlChange(url: String) {
+        dataRepository.setRemoteSandboxUrl(url)
+        _state.update { it.copy(remoteUrl = url) }
+    }
+
+    fun onRemoteTokenChange(token: String) {
+        dataRepository.setRemoteSandboxToken(token)
+        _state.update { it.copy(remoteToken = token) }
+    }
+
+    fun onRemoteDeviceIdChange(deviceId: String) {
+        dataRepository.setRemoteSandboxDeviceId(deviceId)
+        _state.update { it.copy(remoteDeviceId = dataRepository.getRemoteSandboxDeviceId()) }
     }
 }

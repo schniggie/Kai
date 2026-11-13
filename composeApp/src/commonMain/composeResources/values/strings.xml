@@ -357,6 +357,13 @@
     <string name="notification_channel_name">AI Notifications</string>
     <string name="notification_channel_description">Notifications sent by AI assistant</string>
     <string name="settings_sandbox_description">Install a Linux environment so the AI can run shell commands, scripts, and tools on your behalf. Runs securely inside the app.</string>
+    <string name="settings_sandbox_remote_title">Remote Linux Sandbox</string>
+    <string name="settings_sandbox_remote_description">Connect to your Docker orchestrator. Each device gets its own Debian container with full root.</string>
+    <string name="settings_sandbox_remote_url">Orchestrator URL</string>
+    <string name="settings_sandbox_remote_token">API token</string>
+    <string name="settings_sandbox_remote_device_id">Device ID</string>
+    <string name="settings_sandbox_remote_connect">Connect</string>
+    <string name="settings_sandbox_remote_disconnect">Disconnect &amp; wipe</string>
     <string name="settings_sandbox_distro_title">Distribution</string>
     <string name="settings_sandbox_distro_debian">Debian 12</string>
     <string name="settings_sandbox_distro_debian_detail">Recommended · ~150 MB · shared with Kai Build</string>
