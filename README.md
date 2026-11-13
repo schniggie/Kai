@@ -77,7 +77,7 @@ Kai 9000's Interactive UI lets the AI generate full interactive screens — quiz
 - **Settings export/import** — Backup and restore all settings as a JSON file
 - **Encrypted storage** — Conversations stored locally with encryption
 - **Text to speech** — Listen to AI responses
-- **Linux Sandbox** — On Android, the AI can run shell commands, scripts, and tools in a secure sandboxed Linux environment
+- **Linux Sandbox** — On Android, a local proot Linux environment; on iOS, a remote Docker Debian sandbox with full root per device
 - **Image attachments** — Attach images to any conversation
 
 ## Linux Sandbox (Android)

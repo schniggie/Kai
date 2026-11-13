@@ -142,6 +142,9 @@ fun SettingsScreen(
         onResetSandbox = sandboxViewModel::onResetSandbox,
         onInstallPackages = sandboxViewModel::onInstallPackages,
         onMigrateHome = sandboxViewModel::onMigrateHome,
+        onRemoteUrlChange = sandboxViewModel::onRemoteUrlChange,
+        onRemoteTokenChange = sandboxViewModel::onRemoteTokenChange,
+        onRemoteDeviceIdChange = sandboxViewModel::onRemoteDeviceIdChange,
         onNavigateBack = onNavigateBack,
         navigationTabBar = navigationTabBar,
     )
@@ -159,6 +162,9 @@ fun SettingsScreenContent(
     onResetSandbox: () -> Unit = {},
     onInstallPackages: () -> Unit = {},
     onMigrateHome: () -> Unit = {},
+    onRemoteUrlChange: (String) -> Unit = {},
+    onRemoteTokenChange: (String) -> Unit = {},
+    onRemoteDeviceIdChange: (String) -> Unit = {},
     onNavigateBack: () -> Unit = {},
     navigationTabBar: (@Composable () -> Unit)? = null,
 ) {
@@ -319,6 +325,9 @@ fun SettingsScreenContent(
                                     onResetSandbox = onResetSandbox,
                                     onInstallPackages = onInstallPackages,
                                     onMigrateHome = onMigrateHome,
+                                    onRemoteUrlChange = onRemoteUrlChange,
+                                    onRemoteTokenChange = onRemoteTokenChange,
+                                    onRemoteDeviceIdChange = onRemoteDeviceIdChange,
                                 )
                             }
                         }

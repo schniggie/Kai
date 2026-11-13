@@ -1,0 +1,46 @@
+services:
+  orchestrator:
+    build: ./orchestrator
+    image: kai-orchestrator:local
+    ports:
+      - "${KAI_ORCHESTRATOR_PORT:-8080}:8080"
+    environment:
+      TOKENS_FILE: /data/tokens.txt
+      SANDBOX_IMAGE: kai-sandbox:local
+      NETWORK_NAME: kai_sandbox_net
+      IDLE_TIMEOUT_SECONDS: ${IDLE_TIMEOUT_SECONDS:-3600}
+      # Must be the same absolute path on the Docker host (bind-mounted below)
+      # so ext4 volume images are visible to the daemon for hard /root quotas.
+      SANDBOX_VOLUME_ROOT: ${KAI_SANDBOX_VOLUME_ROOT:-/var/lib/kai-sandboxes}
+      MAX_VOLUME_BYTES: ${MAX_VOLUME_BYTES:-2000000000}
+      MAX_INFLIGHT_V1: ${MAX_INFLIGHT_V1:-32}
+      KAI_ALLOW_UNBOUNDED_LAYER: ${KAI_ALLOW_UNBOUNDED_LAYER:-0}
+    volumes:
+      - ./tokens.txt:/data/tokens.txt:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${KAI_SANDBOX_VOLUME_ROOT:-/var/lib/kai-sandboxes}:${KAI_SANDBOX_VOLUME_ROOT:-/var/lib/kai-sandboxes}
+    networks:
+      - kai_edge
+      - kai_sandbox_net
+    restart: unless-stopped
+    mem_limit: ${KAI_ORCHESTRATOR_MEM_LIMIT:-512m}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Built locally and used as the per-device sandbox image. Not started as a
+  # long-running service — the orchestrator creates one container per device.
+  sandbox-image:
+    build: ./sandbox-image
+    image: kai-sandbox:local
+    profiles: ["build"]
+
+networks:
+  kai_edge:
+    driver: bridge
+  kai_sandbox_net:
+    name: kai_sandbox_net
+    driver: bridge
+    internal: false

@@ -50,6 +50,7 @@ nav:
     - System Prompts: features/system-prompts.md
     - Skills: features/skills.md
     - Linux Sandbox: features/sandbox.md
+    - Remote Sandbox: features/remote-sandbox.md
     - Kai Build: features/kai-build.md
     - Notifications: features/notifications.md
     - SMS: features/sms.md

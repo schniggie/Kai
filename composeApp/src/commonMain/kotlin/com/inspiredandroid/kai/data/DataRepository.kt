@@ -133,6 +133,14 @@ interface DataRepository {
     fun getSandboxDistro(): LinuxDistro
     fun setSandboxDistro(distro: LinuxDistro)
 
+    fun getRemoteSandboxUrl(): String
+    fun setRemoteSandboxUrl(url: String)
+    fun getRemoteSandboxToken(): String
+    fun setRemoteSandboxToken(token: String)
+    fun getRemoteSandboxDeviceId(): String
+    fun setRemoteSandboxDeviceId(deviceId: String)
+    fun isRemoteSandboxConfigured(): Boolean
+
     // Kai Build
 
     /** Agent a freshly opened Kai Build project starts with; null is a plain shell. */

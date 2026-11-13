@@ -1,0 +1,8 @@
+# One line per person: token_id  secret  optional label
+# The secret goes in Kai Settings as the API token (Bearer).
+# Each (token_id, device_id) pair gets its own Debian container + volume.
+#
+# Generate a secret with:  python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+
+alice  REPLACE_WITH_SECRET_ALICE  Alice
+bob    REPLACE_WITH_SECRET_BOB    Bob
