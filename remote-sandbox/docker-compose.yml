@@ -13,6 +13,8 @@ services:
       # so ext4 volume images are visible to the daemon for hard /root quotas.
       SANDBOX_VOLUME_ROOT: ${KAI_SANDBOX_VOLUME_ROOT:-/var/lib/kai-sandboxes}
       MAX_VOLUME_BYTES: ${MAX_VOLUME_BYTES:-2000000000}
+      MAX_INFLIGHT_V1: ${MAX_INFLIGHT_V1:-32}
+      KAI_ALLOW_UNBOUNDED_LAYER: ${KAI_ALLOW_UNBOUNDED_LAYER:-0}
     volumes:
       - ./tokens.txt:/data/tokens.txt:ro
       - /var/run/docker.sock:/var/run/docker.sock
@@ -21,6 +23,7 @@ services:
       - kai_edge
       - kai_sandbox_net
     restart: unless-stopped
+    mem_limit: ${KAI_ORCHESTRATOR_MEM_LIMIT:-512m}
     logging:
       driver: json-file
       options:

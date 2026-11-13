@@ -35,7 +35,7 @@ This feature is aimed at a private group. Without an Apple Developer Program mem
 - Terminal streaming is request/response (output arrives when the command finishes), not a live PTY.
 - Apt packages live in the container layer: they survive stop/start, but a wipe recreates a clean image plus the `/root` volume only.
 - Full root is intentional for a trusted group — isolate the Docker host accordingly.
-- Shared-orchestrator caps apply: 5 MiB file payloads, 2000-entry directory listings, 4 active background jobs per sandbox, truncated command output, wall-clock timeouts on exec, PID limit per container, tmpfs-capped `/tmp`, rotated Docker logs for orchestrator and sandboxes, storage_opt container budget when the graph driver supports it, hard ~2 GiB `/root` volumes backed by sparse ext4 images under `SANDBOX_VOLUME_ROOT`, concurrent docker ops globally and per sandbox/token (FS/status/exec share admission), and global/per-token container+volume caps. `/v1` rejects unauthenticated requests before buffering bodies; `/healthz` is rate-limited.
+- Shared-orchestrator caps apply: 5 MiB file payloads, 2000-entry directory listings, 4 active background jobs per sandbox, truncated command output, wall-clock timeouts on exec, PID limit per container, tmpfs-capped `/tmp`, rotated Docker logs for orchestrator and sandboxes, required `storage_opt` writable-layer budget (opt out only via `KAI_ALLOW_UNBOUNDED_LAYER=1`), hard ~2 GiB `/root` volumes backed by sparse ext4 images under `SANDBOX_VOLUME_ROOT`, concurrent docker ops globally and per sandbox/token, concurrent `/v1` admission before body buffering, and a compose memory limit on the orchestrator. `/v1` rejects unauthenticated requests before buffering bodies; `/healthz` is rate-limited.
 
 ## Key Files
 

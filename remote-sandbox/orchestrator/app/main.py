@@ -19,6 +19,8 @@ from .docker_mgr import (
 )
 
 MAX_JSON_BODY_BYTES = 1_000_000
+MAX_INFLIGHT_V1 = int(os.environ.get("MAX_INFLIGHT_V1", "32"))
+_inflight_v1 = asyncio.Semaphore(MAX_INFLIGHT_V1)
 from .models import (
     AcquireRequest,
     ErrorResponse,
@@ -68,26 +70,42 @@ def current_token(authorization: str | None = Header(default=None)) -> Token:
 
 @app.middleware("http")
 async def auth_and_size_gate(request: Request, call_next):
-    """Authenticate /v1 before any body buffering; reject oversized Content-Length early."""
+    """Authenticate /v1 before body buffering; bound concurrent /v1 work and body size."""
     path = request.url.path
-    if path.startswith("/v1/"):
+    if not path.startswith("/v1/"):
+        return await call_next(request)
+
+    try:
+        tokens.authenticate(request.headers.get("authorization"))
+    except PermissionError as exc:
+        return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
         try:
-            tokens.authenticate(request.headers.get("authorization"))
-        except PermissionError as exc:
-            return JSONResponse(status_code=401, content={"detail": str(exc)})
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                size = int(content_length)
-            except ValueError:
-                return JSONResponse(status_code=400, content={"detail": "invalid content-length"})
-            limit = MAX_FS_BYTES + 65_536 if "/fs/" in path else MAX_JSON_BODY_BYTES
-            if size > limit:
-                return JSONResponse(
-                    status_code=413,
-                    content={"detail": f"payload exceeds {limit} bytes"},
-                )
-    return await call_next(request)
+            size = int(content_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "invalid content-length"})
+        limit = MAX_FS_BYTES + 65_536 if "/fs/" in path else MAX_JSON_BODY_BYTES
+        if size > limit:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"payload exceeds {limit} bytes"},
+            )
+
+    # Admit before FastAPI buffers the body so concurrent oversized/chunked
+    # requests cannot unbounded-grow orchestrator RSS.
+    try:
+        await asyncio.wait_for(_inflight_v1.acquire(), timeout=0.05)
+    except TimeoutError:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"at most {MAX_INFLIGHT_V1} concurrent /v1 requests"},
+        )
+    try:
+        return await call_next(request)
+    finally:
+        _inflight_v1.release()
 
 
 _health_lock = threading.Lock()

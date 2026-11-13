@@ -37,6 +37,9 @@ PIDS_LIMIT = int(os.environ.get("PIDS_LIMIT", "256"))
 MAX_CONCURRENT_EXECS_PER_SANDBOX = int(os.environ.get("MAX_CONCURRENT_EXECS_PER_SANDBOX", "4"))
 MAX_CONCURRENT_EXECS_PER_TOKEN = int(os.environ.get("MAX_CONCURRENT_EXECS_PER_TOKEN", "8"))
 MAX_CONCURRENT_DOCKER_OPS = int(os.environ.get("MAX_CONCURRENT_DOCKER_OPS", "32"))
+# When false (default), acquire fails if the Docker host cannot enforce
+# storage_opt size= on the sandbox writable layer.
+ALLOW_UNBOUNDED_LAYER = os.environ.get("KAI_ALLOW_UNBOUNDED_LAYER", "0") == "1"
 
 
 class SandboxLimitError(RuntimeError):
@@ -174,10 +177,19 @@ class DockerManager:
                 try:
                     container = self.client.containers.run(**run_kwargs)
                 except APIError as exc:
-                    # Hosts without storage-opt support still get mem/pids/tmpfs/volume caps.
-                    if "storage opt" in str(exc).lower() or "storage-opt" in str(exc).lower():
+                    msg = str(exc).lower()
+                    storage_unsupported = "storage opt" in msg or "storage-opt" in msg
+                    if storage_unsupported and ALLOW_UNBOUNDED_LAYER:
+                        # Explicit opt-in only — default is fail closed so the
+                        # writable layer cannot silently grow without a budget.
                         run_kwargs.pop("storage_opt", None)
                         container = self.client.containers.run(**run_kwargs)
+                    elif storage_unsupported:
+                        raise SandboxLimitError(
+                            "Docker host does not support storage_opt size= for the "
+                            "sandbox writable layer; enable overlay size quotas or set "
+                            "KAI_ALLOW_UNBOUNDED_LAYER=1"
+                        ) from exc
                     else:
                         raise
             else:
