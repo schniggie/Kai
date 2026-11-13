@@ -24,6 +24,14 @@ JOB_TTL_SECONDS = 3600
 DEFAULT_JOB_TIMEOUT_SECONDS = 3600
 MAX_SANDBOX_CONTAINERS = int(__import__("os").environ.get("MAX_SANDBOX_CONTAINERS", "16"))
 MAX_SANDBOXES_PER_TOKEN = int(__import__("os").environ.get("MAX_SANDBOXES_PER_TOKEN", "4"))
+MAX_VOLUME_BYTES = int(__import__("os").environ.get("MAX_VOLUME_BYTES", str(2_000_000_000)))
+PIDS_LIMIT = int(__import__("os").environ.get("PIDS_LIMIT", "256"))
+MAX_CONCURRENT_EXECS_PER_SANDBOX = int(
+    __import__("os").environ.get("MAX_CONCURRENT_EXECS_PER_SANDBOX", "4")
+)
+MAX_CONCURRENT_EXECS_PER_TOKEN = int(
+    __import__("os").environ.get("MAX_CONCURRENT_EXECS_PER_TOKEN", "8")
+)
 
 
 class SandboxLimitError(RuntimeError):
@@ -76,6 +84,8 @@ class DockerManager:
         self._jobs: dict[str, BackgroundJob] = {}
         self._jobs_lock = threading.Lock()
         self._provision_lock = threading.Lock()
+        self._exec_gate_lock = threading.Lock()
+        self._exec_semaphores: dict[str, threading.BoundedSemaphore] = {}
         self._last_used: dict[str, float] = {}
         self._ensure_network()
         threading.Thread(target=self._idle_reaper, daemon=True).start()
@@ -143,6 +153,7 @@ class DockerManager:
                     },
                     mem_limit="2g",
                     nano_cpus=2_000_000_000,
+                    pids_limit=PIDS_LIMIT,
                     restart_policy={"Name": "unless-stopped"},
                 )
             else:
@@ -223,71 +234,74 @@ class DockerManager:
         if prefixes:
             wrapped = " && ".join(prefixes + [f"( {command} )"])
 
-        if fresh:
-            result = self._docker_exec(
+        with self._exec_slot(token_id, sandbox_id):
+            if fresh:
+                result = self._docker_exec(
+                    container,
+                    [
+                        "timeout",
+                        "--signal=KILL",
+                        str(timeout),
+                        "bash",
+                        "--noprofile",
+                        "--norc",
+                        "-c",
+                        wrapped,
+                    ],
+                    timeout=timeout + 5,
+                )
+                self.touch(sandbox_id)
+                return {
+                    "stdout": _truncate_chars(result["stdout"], MAX_JOB_OUTPUT_CHARS),
+                    "stderr": _truncate_chars(result["stderr"], MAX_JOB_OUTPUT_CHARS),
+                    "exit_code": 124 if result["timed_out"] else result["exit_code"],
+                    "timed_out": result["timed_out"] or result["exit_code"] == 124,
+                    "session_id": session_id,
+                }
+
+            raw = self._docker_exec(
                 container,
                 [
-                    "timeout",
-                    "--signal=KILL",
+                    "kai-session",
+                    "exec",
+                    "--session-id",
+                    session_id,
+                    "--timeout",
                     str(timeout),
-                    "bash",
-                    "--noprofile",
-                    "--norc",
-                    "-c",
                     wrapped,
                 ],
                 timeout=timeout + 5,
             )
-            self.touch(sandbox_id)
-            return {
-                "stdout": _truncate_chars(result["stdout"], MAX_JOB_OUTPUT_CHARS),
-                "stderr": _truncate_chars(result["stderr"], MAX_JOB_OUTPUT_CHARS),
-                "exit_code": 124 if result["timed_out"] else result["exit_code"],
-                "timed_out": result["timed_out"] or result["exit_code"] == 124,
-                "session_id": session_id,
-            }
-
-        payload = {
-            "action": "exec",
-            "session_id": session_id,
-            "timeout": timeout,
-            "command": wrapped,
-        }
-        raw = self._docker_exec(
-            container,
-            ["kai-session", "exec", "--session-id", session_id, "--timeout", str(timeout), wrapped],
-            timeout=timeout + 5,
-        )
-        # Prefer structured JSON from kai-session when present.
-        try:
-            parsed = json.loads(raw["stdout"] or "{}")
-            if parsed.get("ok"):
+            # Prefer structured JSON from kai-session when present.
+            try:
+                parsed = json.loads(raw["stdout"] or "{}")
+                if parsed.get("ok"):
+                    self.touch(sandbox_id)
+                    return {
+                        "stdout": _truncate_chars(str(parsed.get("stdout", "")), MAX_JOB_OUTPUT_CHARS),
+                        "stderr": _truncate_chars(str(parsed.get("stderr", "")), MAX_JOB_OUTPUT_CHARS),
+                        "exit_code": int(parsed.get("exit_code", 0)),
+                        "timed_out": bool(parsed.get("timed_out", False)),
+                        "session_id": session_id,
+                    }
+                err = parsed.get("error") or raw["stderr"] or "session exec failed"
                 self.touch(sandbox_id)
                 return {
-                    "stdout": _truncate_chars(str(parsed.get("stdout", "")), MAX_JOB_OUTPUT_CHARS),
-                    "stderr": _truncate_chars(str(parsed.get("stderr", "")), MAX_JOB_OUTPUT_CHARS),
-                    "exit_code": int(parsed.get("exit_code", 0)),
-                    "timed_out": bool(parsed.get("timed_out", False)),
+                    "stdout": "",
+                    "stderr": str(err),
+                    "exit_code": 1,
+                    "timed_out": False,
                     "session_id": session_id,
                 }
-            err = parsed.get("error") or raw["stderr"] or "session exec failed"
-            self.touch(sandbox_id)
-            return {
-                "stdout": "",
-                "stderr": str(err),
-                "exit_code": 1,
-                "timed_out": False,
-                "session_id": session_id,
-            }
-        except json.JSONDecodeError:
-            self.touch(sandbox_id)
-            return {
-                "stdout": raw["stdout"],
-                "stderr": raw["stderr"] or f"bad session response; payload={payload}",
-                "exit_code": raw["exit_code"],
-                "timed_out": raw["timed_out"],
-                "session_id": session_id,
-            }
+            except json.JSONDecodeError:
+                self.touch(sandbox_id)
+                return {
+                    "stdout": raw["stdout"],
+                    "stderr": raw["stderr"] or "bad session response",
+                    "exit_code": raw["exit_code"],
+                    "timed_out": raw["timed_out"],
+                    "session_id": session_id,
+                }
 
     def close_session(self, token_id: str, device_id: str, session_id: str) -> None:
         sandbox_id = sandbox_id_for(token_id, device_id)
@@ -343,12 +357,31 @@ class DockerManager:
                 f"echo $$ > {shlex.quote(pid_file)}; "
                 f"exec bash --noprofile --norc -c {shlex.quote(inner)}"
             )
-            result = self._docker_exec(
-                container,
-                ["timeout", "--signal=KILL", str(DEFAULT_JOB_TIMEOUT_SECONDS), "bash", "--noprofile", "--norc", "-c", wrapped],
-                timeout=DEFAULT_JOB_TIMEOUT_SECONDS + 5,
-                job=job,
-            )
+            try:
+                with self._exec_slot(token_id, sandbox_id):
+                    result = self._docker_exec(
+                        container,
+                        [
+                            "timeout",
+                            "--signal=KILL",
+                            str(DEFAULT_JOB_TIMEOUT_SECONDS),
+                            "bash",
+                            "--noprofile",
+                            "--norc",
+                            "-c",
+                            wrapped,
+                        ],
+                        timeout=DEFAULT_JOB_TIMEOUT_SECONDS + 5,
+                        job=job,
+                    )
+            except SandboxLimitError as exc:
+                with self._jobs_lock:
+                    job.status = "finished"
+                    job.exit_code = 429
+                    job.stdout = ""
+                    job.stderr = str(exc)
+                    job.finished_at = time.time()
+                return
             with self._jobs_lock:
                 if job.status == "killed":
                     return
@@ -461,6 +494,12 @@ print(json.dumps(entries))
             raise OSError(f"payload exceeds {MAX_FS_BYTES} bytes")
         info = self.acquire(token_id, device_id)
         container = self._require_running(info["sandbox_id"])
+        usage = self._disk_usage(container)
+        if usage + len(content) > MAX_VOLUME_BYTES:
+            raise OSError(
+                f"volume quota {MAX_VOLUME_BYTES} bytes exceeded "
+                f"(used={usage}, write={len(content)})"
+            )
         # Stage as chunked base64 under /tmp so we never put multi-MB argv on
         # the orchestrator or docker exec create call.
         import base64
@@ -559,7 +598,7 @@ print(dest)
 
     def _ping_sessiond(self, container: Container) -> bool:
         try:
-            result = self._docker_exec(container, ["kai-session", "ping"], timeout=5)
+            result = self._docker_exec(container, ["kai-session", "ping"], timeout=5, _raw=True)
             if result["exit_code"] != 0:
                 return False
             data = json.loads(result["stdout"] or "{}")
@@ -567,11 +606,45 @@ print(dest)
         except Exception:
             return False
 
+    def _exec_slot(self, token_id: str, sandbox_id: str):
+        """Context manager that bounds concurrent docker execs per sandbox/token."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            sbx = self._get_exec_sem(f"sbx:{sandbox_id}", MAX_CONCURRENT_EXECS_PER_SANDBOX)
+            tok = self._get_exec_sem(f"tok:{token_id}", MAX_CONCURRENT_EXECS_PER_TOKEN)
+            if not sbx.acquire(blocking=False):
+                raise SandboxLimitError(
+                    f"at most {MAX_CONCURRENT_EXECS_PER_SANDBOX} concurrent execs per sandbox"
+                )
+            if not tok.acquire(blocking=False):
+                sbx.release()
+                raise SandboxLimitError(
+                    f"at most {MAX_CONCURRENT_EXECS_PER_TOKEN} concurrent execs per token"
+                )
+            try:
+                yield
+            finally:
+                tok.release()
+                sbx.release()
+
+        return _cm()
+
+    def _get_exec_sem(self, key: str, limit: int) -> threading.BoundedSemaphore:
+        with self._exec_gate_lock:
+            sem = self._exec_semaphores.get(key)
+            if sem is None:
+                sem = threading.BoundedSemaphore(limit)
+                self._exec_semaphores[key] = sem
+            return sem
+
     def _disk_usage(self, container: Container) -> int:
         result = self._docker_exec(
             container,
             ["bash", "-c", "du -sb /root 2>/dev/null | cut -f1"],
             timeout=15,
+            _raw=True,
         )
         try:
             return int((result["stdout"] or "0").strip() or "0")

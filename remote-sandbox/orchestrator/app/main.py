@@ -15,6 +15,8 @@ from .docker_mgr import (
     SandboxLimitError,
     sandbox_id_for,
 )
+
+MAX_JSON_BODY_BYTES = 1_000_000
 from .models import (
     AcquireRequest,
     ErrorResponse,
@@ -62,6 +64,30 @@ def current_token(authorization: str | None = Header(default=None)) -> Token:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
+@app.middleware("http")
+async def auth_and_size_gate(request: Request, call_next):
+    """Authenticate /v1 before any body buffering; reject oversized Content-Length early."""
+    path = request.url.path
+    if path.startswith("/v1/"):
+        try:
+            tokens.authenticate(request.headers.get("authorization"))
+        except PermissionError as exc:
+            return JSONResponse(status_code=401, content={"detail": str(exc)})
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                size = int(content_length)
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "invalid content-length"})
+            limit = MAX_FS_BYTES + 65_536 if "/fs/" in path else MAX_JSON_BODY_BYTES
+            if size > limit:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"payload exceeds {limit} bytes"},
+                )
+    return await call_next(request)
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -72,9 +98,14 @@ def healthz() -> dict[str, str]:
     response_model=SandboxStatusResponse,
     responses={401: {"model": ErrorResponse}},
 )
-def acquire(body: AcquireRequest, token: Token = Depends(current_token)) -> SandboxStatusResponse:
+async def acquire(request: Request, token: Token = Depends(current_token)) -> SandboxStatusResponse:
+    raw = await _read_body_capped(request, MAX_JSON_BODY_BYTES)
     try:
-        info = get_docker_mgr().acquire(token.token_id, body.device_id)
+        body = AcquireRequest.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}") from exc
+    try:
+        info = await asyncio.to_thread(get_docker_mgr().acquire, token.token_id, body.device_id)
         return SandboxStatusResponse(**info)
     except SandboxLimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
@@ -98,21 +129,27 @@ def destroy(
 
 
 @app.post("/v1/sandboxes/{device_id}/exec", response_model=ExecResponse)
-def exec_command(
+async def exec_command(
     device_id: str,
-    body: ExecRequest,
+    request: Request,
     token: Token = Depends(current_token),
 ) -> ExecResponse:
+    raw = await _read_body_capped(request, MAX_JSON_BODY_BYTES)
     try:
-        result = get_docker_mgr().exec_command(
-            token_id=token.token_id,
-            device_id=device_id,
-            command=body.command,
-            session_id=body.session_id,
-            timeout=body.timeout,
-            working_dir=body.working_dir,
-            env=body.env,
-            fresh=body.fresh,
+        body = ExecRequest.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}") from exc
+    try:
+        result = await asyncio.to_thread(
+            get_docker_mgr().exec_command,
+            token.token_id,
+            device_id,
+            body.command,
+            body.session_id,
+            body.timeout,
+            body.working_dir,
+            body.env,
+            body.fresh,
         )
         return ExecResponse(**result)
     except SandboxLimitError as exc:
@@ -132,13 +169,19 @@ def close_session(
 
 
 @app.post("/v1/sandboxes/{device_id}/jobs", response_model=JobResponse)
-def start_job(
+async def start_job(
     device_id: str,
-    body: JobStartRequest,
+    request: Request,
     token: Token = Depends(current_token),
 ) -> JobResponse:
+    raw = await _read_body_capped(request, MAX_JSON_BODY_BYTES)
     try:
-        job = get_docker_mgr().start_job(
+        body = JobStartRequest.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}") from exc
+    try:
+        job = await asyncio.to_thread(
+            get_docker_mgr().start_job,
             token.token_id,
             device_id,
             body.command,
