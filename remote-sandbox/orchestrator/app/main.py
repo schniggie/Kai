@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -88,8 +90,21 @@ async def auth_and_size_gate(request: Request, call_next):
     return await call_next(request)
 
 
+_health_lock = threading.Lock()
+_health_hits: list[float] = []
+MAX_HEALTHZ_PER_SECOND = int(os.environ.get("MAX_HEALTHZ_PER_SECOND", "30"))
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
+    now = time.time()
+    with _health_lock:
+        # Drop samples older than 1s; reject floods that would only grow access logs.
+        alive = [t for t in _health_hits if now - t < 1.0]
+        if len(alive) >= MAX_HEALTHZ_PER_SECOND:
+            raise HTTPException(status_code=429, detail="healthz rate limited")
+        alive.append(now)
+        _health_hits[:] = alive
     return {"status": "ok"}
 
 

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shlex
+import subprocess
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import docker
@@ -22,20 +25,18 @@ MAX_ACTIVE_JOBS_PER_SANDBOX = 4
 MAX_STORED_JOBS_PER_SANDBOX = 32
 JOB_TTL_SECONDS = 3600
 DEFAULT_JOB_TIMEOUT_SECONDS = 3600
-MAX_SANDBOX_CONTAINERS = int(__import__("os").environ.get("MAX_SANDBOX_CONTAINERS", "16"))
-MAX_SANDBOXES_PER_TOKEN = int(__import__("os").environ.get("MAX_SANDBOXES_PER_TOKEN", "4"))
-MAX_VOLUME_BYTES = int(__import__("os").environ.get("MAX_VOLUME_BYTES", str(2_000_000_000)))
-# Container writable-layer + volume budget enforced via storage_opt when the
-# Docker host supports it (overlay2 + xfs pquota / btrfs / zfs).
-MAX_CONTAINER_BYTES = int(__import__("os").environ.get("MAX_CONTAINER_BYTES", str(8_000_000_000)))
-PIDS_LIMIT = int(__import__("os").environ.get("PIDS_LIMIT", "256"))
-MAX_CONCURRENT_EXECS_PER_SANDBOX = int(
-    __import__("os").environ.get("MAX_CONCURRENT_EXECS_PER_SANDBOX", "4")
-)
-MAX_CONCURRENT_EXECS_PER_TOKEN = int(
-    __import__("os").environ.get("MAX_CONCURRENT_EXECS_PER_TOKEN", "8")
-)
-MAX_CONCURRENT_DOCKER_OPS = int(__import__("os").environ.get("MAX_CONCURRENT_DOCKER_OPS", "32"))
+MAX_SANDBOX_CONTAINERS = int(os.environ.get("MAX_SANDBOX_CONTAINERS", "16"))
+MAX_SANDBOXES_PER_TOKEN = int(os.environ.get("MAX_SANDBOXES_PER_TOKEN", "4"))
+MAX_VOLUME_BYTES = int(os.environ.get("MAX_VOLUME_BYTES", str(2_000_000_000)))
+# Container writable-layer budget via storage_opt when the graph driver supports it.
+MAX_CONTAINER_BYTES = int(os.environ.get("MAX_CONTAINER_BYTES", str(8_000_000_000)))
+# Host path (bind-mounted into the orchestrator at the same absolute path) that
+# holds sparse ext4 images for per-sandbox /root volumes — real size quotas.
+SANDBOX_VOLUME_ROOT = Path(os.environ.get("SANDBOX_VOLUME_ROOT", "/var/lib/kai-sandboxes"))
+PIDS_LIMIT = int(os.environ.get("PIDS_LIMIT", "256"))
+MAX_CONCURRENT_EXECS_PER_SANDBOX = int(os.environ.get("MAX_CONCURRENT_EXECS_PER_SANDBOX", "4"))
+MAX_CONCURRENT_EXECS_PER_TOKEN = int(os.environ.get("MAX_CONCURRENT_EXECS_PER_TOKEN", "8"))
+MAX_CONCURRENT_DOCKER_OPS = int(os.environ.get("MAX_CONCURRENT_DOCKER_OPS", "32"))
 
 
 class SandboxLimitError(RuntimeError):
@@ -133,8 +134,8 @@ class DockerManager:
                             f"at most {MAX_SANDBOXES_PER_TOKEN} volumes per token; "
                             "DELETE with wipe=true to free one"
                         )
-                    self.client.volumes.create(
-                        name=volume,
+                    self._create_quota_volume(
+                        volume,
                         labels={
                             "kai.sandbox": "1",
                             "kai.sandbox_id": sandbox_id,
@@ -224,6 +225,11 @@ class DockerManager:
             try:
                 self.client.volumes.get(vol_name).remove(force=True)
             except Exception:
+                pass
+            img = self._volume_image_path(vol_name)
+            try:
+                img.unlink(missing_ok=True)
+            except OSError:
                 pass
         self._last_used.pop(sandbox_id, None)
 
@@ -697,6 +703,42 @@ print(dest)
             return True
         except NotFound:
             return False
+
+    def _volume_image_path(self, volume_name: str) -> Path:
+        return SANDBOX_VOLUME_ROOT / f"{volume_name}.img"
+
+    def _create_quota_volume(self, volume_name: str, labels: dict[str, str]) -> None:
+        """Create a Docker volume backed by a fixed-size ext4 image (hard quota)."""
+        SANDBOX_VOLUME_ROOT.mkdir(parents=True, exist_ok=True)
+        img = self._volume_image_path(volume_name)
+        if not img.exists():
+            # Sparse file — host only allocates blocks as the guest writes.
+            with open(img, "wb") as handle:
+                handle.truncate(MAX_VOLUME_BYTES)
+            try:
+                subprocess.run(
+                    ["mkfs.ext4", "-F", "-q", str(img)],
+                    check=True,
+                    capture_output=True,
+                )
+            except FileNotFoundError as exc:
+                img.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "mkfs.ext4 not found in orchestrator image; install e2fsprogs"
+                ) from exc
+            except subprocess.CalledProcessError as exc:
+                img.unlink(missing_ok=True)
+                detail = (exc.stderr or exc.stdout or b"").decode("utf-8", "replace")
+                raise RuntimeError(f"failed to format sandbox volume image: {detail}") from exc
+        self.client.volumes.create(
+            name=volume_name,
+            driver="local",
+            driver_opts={
+                "type": "ext4",
+                "device": str(img.resolve()),
+            },
+            labels=labels,
+        )
 
     def _docker_exec(
         self,

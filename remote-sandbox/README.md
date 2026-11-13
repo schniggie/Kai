@@ -89,7 +89,7 @@ Persistent sessions keep cwd/env across calls (per `session_id`). `fresh: true` 
 
 - Full root inside the container is intentional.
 - Cap CPU/memory on containers (defaults: 2 CPU, 2 GB).
-- Orchestrator caps: ≤16 containers host-wide and ≤4 per token; idle stop **removes** the container (volume kept) so slots recycle; FS read/write ≤ 5 MiB (stream-capped, JSON included, Docker I/O off the event loop); listings ≤ 2000 entries; ≤ 4 active jobs per sandbox; truncated output; wall-clock deadlines that SIGKILL lingering execs; finished jobs expire after 1h.
+- Orchestrator caps: ≤16 containers host-wide and ≤4 per token; idle stop **removes** the container (volume kept) so slots recycle; FS read/write ≤ 5 MiB (stream-capped, JSON included, Docker I/O off the event loop); listings ≤ 2000 entries; ≤ 4 active jobs per sandbox; truncated output; wall-clock deadlines that SIGKILL lingering execs; finished jobs expire after 1h; `/root` is a fixed-size ext4 image under `SANDBOX_VOLUME_ROOT` (default `/var/lib/kai-sandboxes`, bind-mounted into the orchestrator); Docker json-file logs rotated (10m × 3) for orchestrator and sandboxes.
 - Keep the orchestrator on a private network / VPN when possible.
 - Rotate or revoke tokens by editing `tokens.txt` (reloaded on every authenticate).
 - Assume a compromised token can attack other containers on `kai_sandbox_net` and the host’s reachable network — isolate accordingly.
