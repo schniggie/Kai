@@ -739,8 +739,6 @@ print(dest)
         job: BackgroundJob | None,
         wrap_pid: bool,
     ) -> dict[str, Any]:
-        import queue
-
         pid_file: str | None = None
         run_cmd = cmd
         if wrap_pid:
@@ -767,56 +765,49 @@ print(dest)
         stream = self.client.api.exec_start(exec_id, demux=True, stream=True)
         stdout_b = bytearray()
         stderr_b = bytearray()
+        state = {"truncated": False}
+        buf_lock = threading.Lock()
+        done = threading.Event()
         timed_out = False
-        truncated = False
         deadline = time.time() + max(1, timeout)
-        events: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        def _append(target: bytearray, data: bytes) -> None:
+            if not data:
+                return
+            if len(target) >= MAX_EXEC_OUTPUT_BYTES:
+                state["truncated"] = True
+                return
+            remain = MAX_EXEC_OUTPUT_BYTES - len(target)
+            target.extend(data[:remain])
+            if len(data) > remain:
+                state["truncated"] = True
 
         def _reader() -> None:
             try:
                 for chunk in stream:
-                    events.put(("chunk", chunk))
-            except Exception as exc:  # noqa: BLE001
-                events.put(("error", exc))
+                    if not chunk:
+                        continue
+                    out_part, err_part = chunk if isinstance(chunk, tuple) else (chunk, b"")
+                    with buf_lock:
+                        _append(stdout_b, out_part or b"")
+                        _append(stderr_b, err_part or b"")
+                        # Once capped, stop reading further chunks to bound memory.
+                        if state["truncated"] and len(stdout_b) >= MAX_EXEC_OUTPUT_BYTES and len(stderr_b) >= MAX_EXEC_OUTPUT_BYTES:
+                            break
+            except Exception:
+                pass
             finally:
-                events.put(("done", None))
+                done.set()
 
         reader = threading.Thread(target=_reader, daemon=True, name=f"kai-exec-{exec_id[:8]}")
         reader.start()
 
-        while True:
+        while not done.is_set():
             remaining = deadline - time.time()
             if remaining <= 0:
                 timed_out = True
                 break
-            try:
-                kind, payload = events.get(timeout=min(0.5, remaining))
-            except queue.Empty:
-                continue
-            if kind == "done":
-                break
-            if kind == "error":
-                break
-            chunk = payload
-            if not chunk:
-                continue
-            out_part, err_part = chunk if isinstance(chunk, tuple) else (chunk, b"")
-            if out_part:
-                if len(stdout_b) < MAX_EXEC_OUTPUT_BYTES:
-                    remain = MAX_EXEC_OUTPUT_BYTES - len(stdout_b)
-                    stdout_b.extend(out_part[:remain])
-                    if len(out_part) > remain:
-                        truncated = True
-                else:
-                    truncated = True
-            if err_part:
-                if len(stderr_b) < MAX_EXEC_OUTPUT_BYTES:
-                    remain = MAX_EXEC_OUTPUT_BYTES - len(stderr_b)
-                    stderr_b.extend(err_part[:remain])
-                    if len(err_part) > remain:
-                        truncated = True
-                else:
-                    truncated = True
+            done.wait(timeout=min(0.5, remaining))
 
         inspect = self.client.api.exec_inspect(exec_id)
         running = bool(inspect.get("Running"))
@@ -831,19 +822,24 @@ print(dest)
                     close()
             except Exception:
                 pass
+        done.wait(timeout=2)
+        with buf_lock:
+            truncated = state["truncated"]
+            out_copy = bytes(stdout_b)
+            err_copy = bytearray(stderr_b)
         if truncated and not binary:
-            stderr_b.extend(b"\n[kai] output truncated\n")
+            err_copy.extend(b"\n[kai] output truncated\n")
         if binary:
             return {
-                "stdout_bytes": bytes(stdout_b),
+                "stdout_bytes": out_copy,
                 "stdout": "",
-                "stderr": bytes(stderr_b).decode("utf-8", "replace"),
+                "stderr": bytes(err_copy).decode("utf-8", "replace"),
                 "exit_code": exit_code,
                 "timed_out": timed_out,
             }
         return {
-            "stdout": bytes(stdout_b).decode("utf-8", "replace"),
-            "stderr": bytes(stderr_b).decode("utf-8", "replace"),
+            "stdout": out_copy.decode("utf-8", "replace"),
+            "stderr": bytes(err_copy).decode("utf-8", "replace"),
             "exit_code": exit_code,
             "timed_out": timed_out,
         }

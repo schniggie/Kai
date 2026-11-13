@@ -37,3 +37,30 @@ def test_token_store_hot_reloads(tmp_path: Path) -> None:
     tokens.write_text("alice secret-a\nbob secret-b\n", encoding="utf-8")
     bob = store.authenticate("Bearer secret-b")
     assert bob.token_id == "bob"
+
+
+def test_token_store_revokes_removed_secret(tmp_path: Path) -> None:
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text("alice secret-a\nbob secret-b\n", encoding="utf-8")
+    store = TokenStore(tokens)
+    assert store.authenticate("Bearer secret-b").token_id == "bob"
+    tokens.write_text("alice secret-a\n", encoding="utf-8")
+    try:
+        store.authenticate("Bearer secret-b")
+        assert False, "expected PermissionError after revoke"
+    except PermissionError:
+        pass
+    assert store.authenticate("Bearer secret-a").token_id == "alice"
+
+
+def test_token_store_missing_file_revokes_all(tmp_path: Path) -> None:
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text("alice secret-a\n", encoding="utf-8")
+    store = TokenStore(tokens)
+    assert store.authenticate("Bearer secret-a").token_id == "alice"
+    tokens.unlink()
+    try:
+        store.authenticate("Bearer secret-a")
+        assert False, "expected PermissionError when tokens file is missing"
+    except PermissionError:
+        pass
