@@ -38,11 +38,19 @@ app = FastAPI(
 )
 
 tokens = TokenStore(TOKENS_FILE)
-docker_mgr = DockerManager(
-    image=SANDBOX_IMAGE,
-    network_name=NETWORK_NAME,
-    idle_timeout_seconds=IDLE_TIMEOUT_SECONDS,
-)
+_docker_mgr: DockerManager | None = None
+
+
+def get_docker_mgr() -> DockerManager:
+    """Lazy so unit tests can import the app without a Docker daemon."""
+    global _docker_mgr
+    if _docker_mgr is None:
+        _docker_mgr = DockerManager(
+            image=SANDBOX_IMAGE,
+            network_name=NETWORK_NAME,
+            idle_timeout_seconds=IDLE_TIMEOUT_SECONDS,
+        )
+    return _docker_mgr
 
 
 def current_token(authorization: str | None = Header(default=None)) -> Token:
@@ -64,7 +72,7 @@ def healthz() -> dict[str, str]:
 )
 def acquire(body: AcquireRequest, token: Token = Depends(current_token)) -> SandboxStatusResponse:
     try:
-        info = docker_mgr.acquire(token.token_id, body.device_id)
+        info = get_docker_mgr().acquire(token.token_id, body.device_id)
         return SandboxStatusResponse(**info)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -72,7 +80,7 @@ def acquire(body: AcquireRequest, token: Token = Depends(current_token)) -> Sand
 
 @app.get("/v1/sandboxes/{device_id}", response_model=SandboxStatusResponse)
 def status(device_id: str, token: Token = Depends(current_token)) -> SandboxStatusResponse:
-    return SandboxStatusResponse(**docker_mgr.status(token.token_id, device_id))
+    return SandboxStatusResponse(**get_docker_mgr().status(token.token_id, device_id))
 
 
 @app.delete("/v1/sandboxes/{device_id}")
@@ -81,7 +89,7 @@ def destroy(
     wipe: bool = Query(default=False),
     token: Token = Depends(current_token),
 ) -> dict[str, bool]:
-    docker_mgr.destroy(token.token_id, device_id, wipe_volume=wipe)
+    get_docker_mgr().destroy(token.token_id, device_id, wipe_volume=wipe)
     return {"ok": True}
 
 
@@ -92,7 +100,7 @@ def exec_command(
     token: Token = Depends(current_token),
 ) -> ExecResponse:
     try:
-        result = docker_mgr.exec_command(
+        result = get_docker_mgr().exec_command(
             token_id=token.token_id,
             device_id=device_id,
             command=body.command,
@@ -113,7 +121,7 @@ def close_session(
     session_id: str,
     token: Token = Depends(current_token),
 ) -> dict[str, bool]:
-    docker_mgr.close_session(token.token_id, device_id, session_id)
+    get_docker_mgr().close_session(token.token_id, device_id, session_id)
     return {"ok": True}
 
 
@@ -124,7 +132,7 @@ def start_job(
     token: Token = Depends(current_token),
 ) -> JobResponse:
     try:
-        job = docker_mgr.start_job(
+        job = get_docker_mgr().start_job(
             token.token_id,
             device_id,
             body.command,
@@ -157,13 +165,13 @@ def list_jobs(device_id: str, token: Token = Depends(current_token)) -> list[Job
             stdout=j.stdout,
             stderr=j.stderr,
         )
-        for j in docker_mgr.list_jobs(sandbox_id)
+        for j in get_docker_mgr().list_jobs(sandbox_id)
     ]
 
 
 @app.get("/v1/sandboxes/{device_id}/jobs/{job_id}", response_model=JobResponse)
 def get_job(device_id: str, job_id: str, token: Token = Depends(current_token)) -> JobResponse:
-    job = docker_mgr.get_job(job_id)
+    job = get_docker_mgr().get_job(job_id)
     if job is None or job.sandbox_id != sandbox_id_for(token.token_id, device_id):
         raise HTTPException(status_code=404, detail="job not found")
     return JobResponse(
@@ -178,10 +186,10 @@ def get_job(device_id: str, job_id: str, token: Token = Depends(current_token)) 
 
 @app.post("/v1/sandboxes/{device_id}/jobs/{job_id}/kill", response_model=JobResponse)
 def kill_job(device_id: str, job_id: str, token: Token = Depends(current_token)) -> JobResponse:
-    job = docker_mgr.get_job(job_id)
+    job = get_docker_mgr().get_job(job_id)
     if job is None or job.sandbox_id != sandbox_id_for(token.token_id, device_id):
         raise HTTPException(status_code=404, detail="job not found")
-    job = docker_mgr.kill_job(job_id) or job
+    job = get_docker_mgr().kill_job(job_id) or job
     return JobResponse(
         job_id=job.job_id,
         status=job.status,
@@ -194,10 +202,10 @@ def kill_job(device_id: str, job_id: str, token: Token = Depends(current_token))
 
 @app.delete("/v1/sandboxes/{device_id}/jobs/{job_id}")
 def remove_job(device_id: str, job_id: str, token: Token = Depends(current_token)) -> dict[str, bool]:
-    job = docker_mgr.get_job(job_id)
+    job = get_docker_mgr().get_job(job_id)
     if job is None or job.sandbox_id != sandbox_id_for(token.token_id, device_id):
         raise HTTPException(status_code=404, detail="job not found")
-    docker_mgr.remove_job(job_id)
+    get_docker_mgr().remove_job(job_id)
     return {"ok": True}
 
 
@@ -209,7 +217,7 @@ def list_fs(
 ) -> FsListResponse:
     _assert_safe_path(path)
     try:
-        entries = docker_mgr.list_fs(token.token_id, device_id, path)
+        entries = get_docker_mgr().list_fs(token.token_id, device_id, path)
         return FsListResponse(path=path, entries=[FsEntry(**e) for e in entries])
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -224,7 +232,7 @@ def read_fs(
 ) -> Response:
     _assert_safe_path(path)
     try:
-        data = docker_mgr.read_fs(token.token_id, device_id, path, max_bytes)
+        data = get_docker_mgr().read_fs(token.token_id, device_id, path, max_bytes)
         return Response(content=data, media_type="application/octet-stream")
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -245,11 +253,10 @@ async def write_fs_raw(
                 raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="invalid content-length") from exc
-    body = await request.body()
-    if len(body) > MAX_FS_BYTES:
-        raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
+    # Stream with a hard cap so chunked / missing Content-Length cannot buffer unbounded.
+    body = await _read_body_capped(request, MAX_FS_BYTES)
     try:
-        docker_mgr.write_fs(token.token_id, device_id, path, body)
+        get_docker_mgr().write_fs(token.token_id, device_id, path, body)
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -271,7 +278,7 @@ def write_fs_text(
     if len(encoded) > MAX_FS_BYTES:
         raise HTTPException(status_code=413, detail=f"payload exceeds {MAX_FS_BYTES} bytes")
     try:
-        docker_mgr.write_fs(token.token_id, device_id, body.path, encoded)
+        get_docker_mgr().write_fs(token.token_id, device_id, body.path, encoded)
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -286,7 +293,7 @@ def delete_fs(
 ) -> dict[str, bool]:
     _assert_safe_path(path)
     try:
-        docker_mgr.delete_fs(token.token_id, device_id, path, recursive)
+        get_docker_mgr().delete_fs(token.token_id, device_id, path, recursive)
         return {"ok": True}
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -301,7 +308,7 @@ def rename_fs(
 ) -> dict[str, str]:
     _assert_safe_path(path)
     try:
-        dest = docker_mgr.rename_fs(token.token_id, device_id, path, new_name)
+        dest = get_docker_mgr().rename_fs(token.token_id, device_id, path, new_name)
         return {"path": dest}
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -314,6 +321,20 @@ def _assert_safe_path(path: str) -> None:
         raise HTTPException(status_code=400, detail="path must be absolute")
     if "/../" in path or path.endswith("/..") or path == "/..":
         raise HTTPException(status_code=400, detail="path traversal rejected")
+
+
+async def _read_body_capped(request: Request, max_bytes: int) -> bytes:
+    """Accumulate at most [max_bytes]; abort with 413 as soon as the cap is exceeded."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail=f"payload exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.exception_handler(Exception)
