@@ -22,6 +22,11 @@ MAX_ACTIVE_JOBS_PER_SANDBOX = 4
 MAX_STORED_JOBS_PER_SANDBOX = 32
 JOB_TTL_SECONDS = 3600
 DEFAULT_JOB_TIMEOUT_SECONDS = 3600
+MAX_SANDBOX_CONTAINERS = int(__import__("os").environ.get("MAX_SANDBOX_CONTAINERS", "16"))
+
+
+class SandboxLimitError(RuntimeError):
+    pass
 
 
 def sandbox_id_for(token_id: str, device_id: str) -> str:
@@ -88,6 +93,11 @@ class DockerManager:
 
         container = self._get_container(name)
         if container is None:
+            existing = self._count_sandbox_containers()
+            if existing >= MAX_SANDBOX_CONTAINERS:
+                raise SandboxLimitError(
+                    f"at most {MAX_SANDBOX_CONTAINERS} sandbox containers allowed"
+                )
             container = self.client.containers.run(
                 image=self.image,
                 name=name,
@@ -605,6 +615,7 @@ print(dest)
         if timed_out or running:
             timed_out = True
             exit_code = 124
+            self._kill_exec(inspect)
         if truncated and not binary:
             stderr_b.extend(b"\n[kai] output truncated\n")
         if binary:
@@ -621,6 +632,33 @@ print(dest)
             "exit_code": exit_code,
             "timed_out": timed_out,
         }
+
+    def _kill_exec(self, inspect: dict[str, Any]) -> None:
+        """Stop a still-running docker exec after a stream deadline."""
+        import os
+        import signal
+
+        pid = inspect.get("Pid")
+        if isinstance(pid, int) and pid > 1:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                pass
+        # Fallback: nothing else we can do without container context.
+
+    def _count_sandbox_containers(self) -> int:
+        try:
+            return len(
+                self.client.containers.list(
+                    all=True,
+                    filters={"label": "kai.sandbox=1"},
+                )
+            )
+        except APIError:
+            return 0
 
     def _expire_jobs_locked(self, sandbox_id: str) -> None:
         now = time.time()

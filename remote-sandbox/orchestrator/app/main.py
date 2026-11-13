@@ -11,6 +11,7 @@ from .docker_mgr import (
     MAX_FS_BYTES,
     DockerManager,
     JobLimitError,
+    SandboxLimitError,
     sandbox_id_for,
 )
 from .models import (
@@ -74,6 +75,8 @@ def acquire(body: AcquireRequest, token: Token = Depends(current_token)) -> Sand
     try:
         info = get_docker_mgr().acquire(token.token_id, body.device_id)
         return SandboxStatusResponse(**info)
+    except SandboxLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -111,6 +114,8 @@ def exec_command(
             fresh=body.fresh,
         )
         return ExecResponse(**result)
+    except SandboxLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -139,7 +144,7 @@ def start_job(
             body.working_dir,
             body.env,
         )
-    except JobLimitError as exc:
+    except (JobLimitError, SandboxLimitError) as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -263,11 +268,18 @@ async def write_fs_raw(
 
 
 @app.put("/v1/sandboxes/{device_id}/fs/text")
-def write_fs_text(
+async def write_fs_text(
     device_id: str,
-    body: FsWriteRequest,
+    request: Request,
     token: Token = Depends(current_token),
 ) -> dict[str, bool]:
+    # Cap before JSON parse — Starlette would otherwise buffer an unbounded body.
+    # Allow a small JSON-envelope overhead above the file-content cap.
+    raw = await _read_body_capped(request, MAX_FS_BYTES + 65_536)
+    try:
+        body = FsWriteRequest.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}") from exc
     _assert_safe_path(body.path)
     try:
         encoded = body.content.encode(body.encoding)
