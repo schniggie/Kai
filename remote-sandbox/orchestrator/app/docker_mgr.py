@@ -88,15 +88,25 @@ class DockerManager:
         sandbox_id = sandbox_id_for(token_id, device_id)
         name = container_name_for(sandbox_id)
         volume = volume_name_for(sandbox_id)
-        if not self._volume_exists(volume):
-            self.client.volumes.create(name=volume)
 
         container = self._get_container(name)
         if container is None:
+            # Count before creating either the volume or the container so a
+            # rejected acquire cannot leave orphan volumes behind.
             existing = self._count_sandbox_containers()
             if existing >= MAX_SANDBOX_CONTAINERS:
                 raise SandboxLimitError(
                     f"at most {MAX_SANDBOX_CONTAINERS} sandbox containers allowed"
+                )
+            if not self._volume_exists(volume):
+                self.client.volumes.create(
+                    name=volume,
+                    labels={
+                        "kai.sandbox": "1",
+                        "kai.sandbox_id": sandbox_id,
+                        "kai.token_id": token_id,
+                        "kai.device_id": device_id,
+                    },
                 )
             container = self.client.containers.run(
                 image=self.image,
@@ -564,7 +574,13 @@ print(dest)
         binary: bool = False,
         job: BackgroundJob | None = None,
     ) -> dict[str, Any]:
-        """Run a command with a wall-clock deadline and a hard output byte cap."""
+        """Run a command with a wall-clock deadline and a hard output byte cap.
+
+        The stream reader runs on a side thread so a silent (no-output) command
+        still hits the deadline — a plain `for chunk in stream` would block forever.
+        """
+        import queue
+
         exec_id = self.client.api.exec_create(
             container.id,
             cmd,
@@ -581,33 +597,53 @@ print(dest)
         timed_out = False
         truncated = False
         deadline = time.time() + max(1, timeout)
+        events: queue.Queue[tuple[str, Any]] = queue.Queue()
 
-        try:
-            for chunk in stream:
-                if time.time() > deadline:
-                    timed_out = True
-                    break
-                if not chunk:
-                    continue
-                out_part, err_part = chunk if isinstance(chunk, tuple) else (chunk, b"")
-                if out_part:
-                    if len(stdout_b) < MAX_EXEC_OUTPUT_BYTES:
-                        remain = MAX_EXEC_OUTPUT_BYTES - len(stdout_b)
-                        stdout_b.extend(out_part[:remain])
-                        if len(out_part) > remain:
-                            truncated = True
-                    else:
+        def _reader() -> None:
+            try:
+                for chunk in stream:
+                    events.put(("chunk", chunk))
+            except Exception as exc:  # noqa: BLE001
+                events.put(("error", exc))
+            finally:
+                events.put(("done", None))
+
+        reader = threading.Thread(target=_reader, daemon=True, name=f"kai-exec-{exec_id[:8]}")
+        reader.start()
+
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                kind, payload = events.get(timeout=min(0.5, remaining))
+            except queue.Empty:
+                continue
+            if kind == "done":
+                break
+            if kind == "error":
+                break
+            chunk = payload
+            if not chunk:
+                continue
+            out_part, err_part = chunk if isinstance(chunk, tuple) else (chunk, b"")
+            if out_part:
+                if len(stdout_b) < MAX_EXEC_OUTPUT_BYTES:
+                    remain = MAX_EXEC_OUTPUT_BYTES - len(stdout_b)
+                    stdout_b.extend(out_part[:remain])
+                    if len(out_part) > remain:
                         truncated = True
-                if err_part:
-                    if len(stderr_b) < MAX_EXEC_OUTPUT_BYTES:
-                        remain = MAX_EXEC_OUTPUT_BYTES - len(stderr_b)
-                        stderr_b.extend(err_part[:remain])
-                        if len(err_part) > remain:
-                            truncated = True
-                    else:
+                else:
+                    truncated = True
+            if err_part:
+                if len(stderr_b) < MAX_EXEC_OUTPUT_BYTES:
+                    remain = MAX_EXEC_OUTPUT_BYTES - len(stderr_b)
+                    stderr_b.extend(err_part[:remain])
+                    if len(err_part) > remain:
                         truncated = True
-        except Exception:
-            pass
+                else:
+                    truncated = True
 
         inspect = self.client.api.exec_inspect(exec_id)
         running = bool(inspect.get("Running"))
